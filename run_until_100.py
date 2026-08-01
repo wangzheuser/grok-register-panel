@@ -104,19 +104,22 @@ def start_batch(count: int):
     except OSError:
         pass
     fout = os.fdopen(fd, "w", encoding="utf-8")
+    cmd = []
+    if os.name != "nt":
+        cmd.extend(["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"])
+    
+    python_bin = ROOT / ".venv/Scripts/python.exe" if os.name == "nt" else ROOT / ".venv/bin/python"
+    
+    cmd.extend([
+        str(python_bin),
+        "-u",
+        str(ROOT / "run_batch_headless.py"),
+        str(count),
+        str(WORKERS),
+    ])
     try:
         proc = subprocess.Popen(
-            [
-                "xvfb-run",
-                "-a",
-                "-s",
-                "-screen 0 1920x1080x24",
-                str(ROOT / ".venv/bin/python"),
-                "-u",
-                str(ROOT / "run_batch_headless.py"),
-                str(count),
-                str(WORKERS),
-            ],
+            cmd,
             cwd=str(ROOT),
             stdout=fout,
             stderr=subprocess.STDOUT,

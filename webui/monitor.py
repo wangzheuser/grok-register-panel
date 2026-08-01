@@ -109,7 +109,7 @@ CONTROL_FILE = LOG_DIR / "monitor_control.json"
 STATS_CACHE = LOG_DIR / "monitor_stats.json"
 BIND_HOST = os.environ.get("MONITOR_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("MONITOR_PORT", "8787"))
-VENV_PY = ROOT / ".venv/bin/python"
+VENV_PY = ROOT / ".venv/Scripts/python.exe" if os.name == "nt" else ROOT / ".venv/bin/python"
 ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
@@ -700,13 +700,18 @@ def _start_batch_only_unlocked():
     except OSError:
         pass
     fout = os.fdopen(fd, "w", encoding="utf-8")
+    
+    cmd = []
+    if os.name != "nt":
+        cmd.extend(["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"])
+    cmd.extend([
+        str(VENV_PY), "-u", str(ROOT / "run_batch_headless.py"),
+        str(count), str(workers),
+    ])
+    
     try:
         p = subprocess.Popen(
-            [
-                "xvfb-run", "-a", "-s", "-screen 0 1920x1080x24",
-                str(VENV_PY), "-u", str(ROOT / "run_batch_headless.py"),
-                str(count), str(workers),
-            ],
+            cmd,
             cwd=str(ROOT),
             stdout=fout,
             stderr=subprocess.STDOUT,

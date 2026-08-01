@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
+import queue
 import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+import psutil
 
 from secure_files import atomic_write_json, exclusive_file_lock
 
@@ -89,11 +90,15 @@ def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5
     if process.poll() is not None:
         return
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:  # pragma: no cover - Windows fallback
-            process.terminate()
-    except ProcessLookupError:
+        parent = psutil.Process(process.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        parent.terminate()
+    except psutil.NoSuchProcess:
         return
     try:
         process.wait(timeout=max(0.1, grace_seconds))
@@ -101,11 +106,15 @@ def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5
     except subprocess.TimeoutExpired:
         pass
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:  # pragma: no cover - Windows fallback
-            process.kill()
-    except ProcessLookupError:
+        parent = psutil.Process(process.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        parent.kill()
+    except psutil.NoSuchProcess:
         pass
     try:
         process.wait(timeout=2)
@@ -176,36 +185,52 @@ def run_supervisor(
                 env=env,
             )
             assert active_process.stdout is not None
-            selector = selectors.DefaultSelector()
-            selector.register(active_process.stdout, selectors.EVENT_READ)
+            q = queue.Queue()
+            
+            def enqueue_output(out, q):
+                for line in iter(out.readline, ''):
+                    if not line:
+                        break
+                    q.put(line)
+                q.put(None)
+                
+            t = threading.Thread(target=enqueue_output, args=(active_process.stdout, q))
+            t.daemon = True
+            t.start()
+            
             last_output = time.monotonic()
             restart_reason = ""
 
-            try:
-                while not stop_requested:
-                    events = selector.select(timeout=1.0)
-                    for key, _mask in events:
-                        line = key.fileobj.readline()
-                        if not line:
-                            continue
-                        last_output = time.monotonic()
-                        print(line, end="", flush=True)
-                        if is_driver_crash_line(line):
-                            restart_reason = "playwright driver crashed"
+            while not stop_requested:
+                try:
+                    line = q.get(timeout=1.0)
+                    if line is None:
+                        break
+                    last_output = time.monotonic()
+                    print(line, end="", flush=True)
+                    if is_driver_crash_line(line):
+                        restart_reason = "playwright driver crashed"
+                        break
+                except queue.Empty:
+                    pass
+                
+                if restart_reason:
+                    break
+                
+                return_code = active_process.poll()
+                if return_code is not None:
+                    while not q.empty():
+                        try:
+                            line = q.get_nowait()
+                            if line is not None:
+                                print(line, end="", flush=True)
+                        except queue.Empty:
                             break
-                    if restart_reason:
-                        break
-                    return_code = active_process.poll()
-                    if return_code is not None:
-                        tail = active_process.stdout.read()
-                        if tail:
-                            print(tail, end="", flush=True)
-                        break
-                    if time.monotonic() - last_output > max(1.0, float(idle_timeout)):
-                        restart_reason = f"no child output for {int(idle_timeout)}s"
-                        break
-            finally:
-                selector.close()
+                    break
+                
+                if time.monotonic() - last_output > max(1.0, float(idle_timeout)):
+                    restart_reason = f"no child output for {int(idle_timeout)}s"
+                    break
 
             if stop_requested:
                 _terminate_process_group(active_process)

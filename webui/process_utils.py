@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+import psutil
 
 try:
     from secure_files import atomic_write_text
@@ -21,17 +22,21 @@ except ImportError:  # running from webui/
 
 def _cmdline(pid: int) -> list[str]:
     try:
-        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
-        return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
-    except (OSError, ValueError):
+        proc = psutil.Process(pid)
+        return proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError):
         return []
 
 
 def _cwd(pid: int) -> Path | None:
     try:
-        return Path(os.readlink(f"/proc/{int(pid)}/cwd")).resolve()
-    except (OSError, ValueError):
-        return None
+        proc = psutil.Process(pid)
+        cwd_str = proc.cwd()
+        if cwd_str:
+            return Path(cwd_str).resolve()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError):
+        pass
+    return None
 
 
 def _resolved_arg(arg: str, cwd: Path) -> Path | None:
@@ -67,38 +72,37 @@ def find_managed_processes(
     script_names: tuple[str, ...] | list[str],
 ) -> list[dict]:
     found = []
-    proc_root = Path("/proc")
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if not process_matches(pid, root, script_names):
-            continue
-        cmdline = _cmdline(pid)
-        etime = ""
+    for proc in psutil.process_iter(['pid', 'cmdline', 'cwd', 'create_time']):
         try:
-            pgid = os.getpgid(pid)
-        except OSError:
+            pid = proc.info['pid']
+            if not process_matches(pid, root, script_names):
+                continue
+            cmdline = proc.info['cmdline'] or []
+            
+            create_time = proc.info['create_time']
+            elapsed = int(time.time() - create_time) if create_time else 0
+            if elapsed < 3600:
+                etime = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+            else:
+                etime = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
+            
             pgid = None
-        try:
-            result = subprocess.run(
-                ["ps", "-o", "etime=", "-p", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                check=False,
+            if hasattr(os, "getpgid"):
+                try:
+                    pgid = os.getpgid(pid)
+                except OSError:
+                    pass
+            
+            found.append(
+                {
+                    "pid": pid,
+                    "pgid": pgid,
+                    "etime": etime,
+                    "cmd": " ".join(cmdline)[:240],
+                }
             )
-            etime = result.stdout.strip()
-        except Exception:
-            pass
-        found.append(
-            {
-                "pid": pid,
-                "pgid": pgid,
-                "etime": etime,
-                "cmd": " ".join(cmdline)[:240],
-            }
-        )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+            continue
     return sorted(found, key=lambda item: item["pid"])
 
 
@@ -132,28 +136,18 @@ def terminate_managed_processes(
     if not pids:
         return []
 
-    groups: set[int] = set()
-    direct: set[int] = set()
     for pid in pids:
         try:
-            pgid = os.getpgid(pid)
-        except OSError:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            parent.terminate()
+        except psutil.NoSuchProcess:
             continue
-        if pgid == pid:
-            groups.add(pgid)
-        else:
-            direct.add(pid)
-
-    for pgid in groups:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except OSError:
-            pass
-    for pid in direct:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
 
     deadline = time.monotonic() + max(0.0, grace_seconds)
     while time.monotonic() < deadline:
@@ -165,11 +159,14 @@ def terminate_managed_processes(
     for item in remaining:
         pid = item["pid"]
         try:
-            pgid = os.getpgid(pid)
-            if pgid == pid:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGKILL)
-        except OSError:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            parent.kill()
+        except psutil.NoSuchProcess:
             pass
     return sorted(pids)
