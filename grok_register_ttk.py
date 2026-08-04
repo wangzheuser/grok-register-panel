@@ -750,7 +750,7 @@ def cloudflare_create_temp_address(api_base, domain=""):
         auth_mode=get_cloudflare_auth_mode(),
         custom_auth=get_cloudflare_custom_auth(),
         name=generate_username(10),
-        randomize_subdomain=not bool(domain),
+        randomize_subdomain=False,
     )
 
 
@@ -3917,7 +3917,9 @@ def run_registration_cli(count):
                 cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
                 cli_log("[*] 5. 等待 sso cookie")
                 sso = wait_for_sso_cookie(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
+                    timeout=45,
+                    log_callback=cli_log,
+                    cancel_callback=controller.should_stop,
                 )
                 ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
                 if config.get("enable_nsfw", True):
@@ -4054,7 +4056,7 @@ def run_registration_cli(count):
             wait_sec = parse_account_interval()
             if wait_sec > 0:
                 cli_log(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
-                _sleep_cancelable(wait_sec, controller.should_stop)
+                sleep_with_cancel(wait_sec, controller.should_stop)
             try:
                 stop_browser()
                 time.sleep(0.5)

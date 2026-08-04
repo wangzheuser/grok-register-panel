@@ -1849,7 +1849,7 @@ btn.focus(); btn.click(); return 'submitted';
     _raise_profile_fail()
 
 
-def wait_for_sso_cookie(timeout=10, log_callback=None, cancel_callback=None):
+def wait_for_sso_cookie(timeout=45, log_callback=None, cancel_callback=None):
     """等注册完成后的 sso cookie。
 
     关键：不要一看到「正在登录」就强制 page.get(grok.com)，
