@@ -89,6 +89,65 @@ def test_monitor_http_auth_and_headers():
             os.environ["MONITOR_TOKEN"] = previous
 
 
+def test_control_batch_count_persists_in_control_and_status():
+    token = "test-control-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_file = monitor.CONTROL_FILE
+    with tempfile.TemporaryDirectory() as temp:
+        monitor.CONTROL_FILE = Path(temp) / "monitor_control.json"
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            payload = json.dumps(
+                {
+                    "workers": 3,
+                    "batch_count": 30,
+                    "add_count": 1,
+                    "risk_pause": 2,
+                    "mode": "orch",
+                }
+            ).encode("utf-8")
+            status, _, body = request(
+                base + "/api/control",
+                token=token,
+                method="POST",
+                body=payload,
+            )
+            assert status == 200
+            assert json.loads(body)["batch_count"] == 30
+
+            status, _, body = request(base + "/api/control", token=token)
+            assert status == 200
+            assert json.loads(body)["batch_count"] == 30
+
+            status, _, body = request(base + "/api/status", token=token)
+            assert status == 200
+            assert json.loads(body)["control"]["batch_count"] == 30
+            assert monitor.load_control()["batch_count"] == 30
+
+            oversized = json.dumps({"batch_count": 1001}).encode("utf-8")
+            status, _, body = request(
+                base + "/api/control",
+                token=token,
+                method="POST",
+                body=oversized,
+            )
+            assert status == 200
+            assert json.loads(body)["batch_count"] == 1000
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            monitor.CONTROL_FILE = previous_file
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
 def test_proxy_api_auth_mutations_and_redaction():
     token = "test-proxy-token-123456"
     secret = "proxy-secret-value-99"

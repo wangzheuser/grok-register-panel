@@ -76,6 +76,18 @@ def test_compact_overview_density():
     assert '@media (min-width: 1121px)' in mon
     assert '.control-panel .control-actions button {' in mon
 
+
+def test_control_fields_keep_unsaved_values_and_start_uses_one_snapshot():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    assert 'id="batch_count" min="1" max="1000"' in mon
+    assert 'const dirtyControlFields = new Set();' in mon
+    assert '!dirtyControlFields.has(id)' in mon
+    assert 'dirtyControlFields.add(id)' in mon
+    assert 'dirtyControlFields.clear();' in mon
+    assert 'const payload = controlBody();' in mon
+    assert mon.count('body: JSON.stringify(payload)') >= 3
+    assert 'document.activeElement && ["workers-input","batch_count"' not in mon
+
 def test_help_and_faq_module():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]

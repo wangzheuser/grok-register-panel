@@ -182,7 +182,7 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["risk_pause"] = 10
         try:
-            c["batch_count"] = max(1, min(200, int(c.get("batch_count", 40))))
+            c["batch_count"] = max(1, min(1000, int(c.get("batch_count", 40))))
         except Exception:
             c["batch_count"] = 40
         try:
@@ -1811,7 +1811,7 @@ HTML = r"""<!DOCTYPE html>
         <input type="number" id="workers-input" min="1" max="24" value="3"/>
       </div>
       <div class="field"><label for="batch_count">单批数量</label>
-        <input type="number" id="batch_count" min="1" max="200" value="40"/>
+        <input type="number" id="batch_count" min="1" max="1000" value="40"/>
       </div>
       <div class="field"><label for="add_count">追加目标</label>
         <input type="number" id="add_count" min="1" max="500" value="40" title="每次启动从当前 CPA 再注册 N 个"/>
@@ -2216,6 +2216,8 @@ HTML = r"""<!DOCTYPE html>
 let last = null;
 let proxyData = null;
 let clearResinTemplatePending = false;
+const controlFieldIds = ["workers-input", "batch_count", "add_count", "risk_pause", "mode"];
+const dirtyControlFields = new Set();
 let domainData = null;
 let emailProviderData = null;
 let selectedEmailProvider = "";
@@ -2909,12 +2911,15 @@ async function refresh() {
 }
 function fillControl(d) {
   const c = d.control || {};
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode"].includes(document.activeElement.id)) return;
-  if (c.workers != null) document.getElementById("workers-input").value = c.workers;
-  if (c.batch_count != null) document.getElementById("batch_count").value = c.batch_count;
-  if (c.add_count != null && document.getElementById("add_count")) document.getElementById("add_count").value = c.add_count;
-  if (c.risk_pause != null) document.getElementById("risk_pause").value = c.risk_pause;
-  if (c.mode) document.getElementById("mode").value = c.mode;
+  const sync = (id, value) => {
+    const element = document.getElementById(id);
+    if (element && value != null && !dirtyControlFields.has(id)) element.value = value;
+  };
+  sync("workers-input", c.workers);
+  sync("batch_count", c.batch_count);
+  sync("add_count", c.add_count);
+  sync("risk_pause", c.risk_pause);
+  sync("mode", c.mode);
 }
 function controlBody() {
   return {
@@ -2927,16 +2932,22 @@ function controlBody() {
 }
 async function saveCtrl() {
   try {
-    const j = await api("/api/control", { method: "POST", body: JSON.stringify(controlBody()) });
+    const payload = controlBody();
+    const j = await api("/api/control", { method: "POST", body: JSON.stringify(payload) });
+    dirtyControlFields.clear();
+    fillControl({ control: j });
     setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers, "ok");
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
 }
 async function doStart() {
   document.getElementById("btn-start").disabled = true;
   setMsg("ctrl-msg", "正在启动…", "");
+  const payload = controlBody();
   try {
-    await api("/api/control", { method: "POST", body: JSON.stringify(controlBody()) });
-    const j = await api("/api/start", { method: "POST", body: JSON.stringify(controlBody()) });
+    const saved = await api("/api/control", { method: "POST", body: JSON.stringify(payload) });
+    dirtyControlFields.clear();
+    fillControl({ control: saved });
+    const j = await api("/api/start", { method: "POST", body: JSON.stringify(payload) });
     if (j.ok === false) throw new Error(j.error || "start failed");
     const msg = j.message || ("已启动，进程 " + (j.pid || "?") + "，模式 " + (j.mode || ""));
     setMsg("ctrl-msg", msg + (j.need != null ? "，剩余 " + j.need : ""), "ok");
@@ -3166,6 +3177,12 @@ initHelp();
 loadTokenField();
 refresh();
 setInterval(refresh, 2000);
+controlFieldIds.forEach(id => {
+  const element = document.getElementById(id);
+  if (!element) return;
+  element.addEventListener("input", () => dirtyControlFields.add(id));
+  element.addEventListener("change", () => dirtyControlFields.add(id));
+});
 // full stats once on load
 refreshStats(false);
 refreshRecovery();

@@ -26,6 +26,7 @@ LOG_DIR = ROOT / "log"
 RESULTS = LOG_DIR / "register_results.jsonl"
 ORCH_LOG = LOG_DIR / f"orch100-fixed-{time.strftime('%Y%m%d-%H%M%S')}.log"
 WORKERS = 3
+BATCH_COUNT = 40
 BASE0 = int(__import__("os").environ.get("ORCH_BASE_CPA", "0") or 0)
 TARGET_CPA = BASE0 + int(__import__("os").environ.get("ORCH_ADD_COUNT", "100") or 100)
 RISK_PAUSE = 10
@@ -42,9 +43,17 @@ def load_control() -> dict:
     return {}
 
 
+def resolve_batch_count(control: dict, default: int = 40) -> int:
+    try:
+        return max(1, min(1000, int(control.get("batch_count", default))))
+    except (TypeError, ValueError):
+        return default
+
+
 def apply_control() -> None:
-    global WORKERS, RISK_PAUSE, TARGET_CPA, BASE0
+    global WORKERS, BATCH_COUNT, RISK_PAUSE, TARGET_CPA, BASE0
     c = load_control()
+    BATCH_COUNT = resolve_batch_count(c)
     if c.get("workers"):
         try:
             WORKERS = max(1, min(24, int(c["workers"])))
@@ -292,13 +301,13 @@ def main():
         log(f"final blocklist={sorted(read_blocklist_asns())}")
         return
 
-    log(f"rules: workers={WORKERS} pause_on_risk_only={RISK_PAUSE} SSO ignored block={sorted(read_blocklist_asns())}")
+    log(f"rules: workers={WORKERS} batch_count={BATCH_COUNT} pause_on_risk_only={RISK_PAUSE} SSO ignored block={sorted(read_blocklist_asns())}")
     
     round_i = 0
     while cpa_count() < TARGET_CPA and round_i < MAX_ROUNDS:
         round_i += 1
         need = TARGET_CPA - cpa_count()
-        batch_n = min(max(need + 8, 15), 40)
+        batch_n = BATCH_COUNT
         log(f"=== ROUND {round_i} need={need} batch_n={batch_n} cpa={cpa_count()} block={sorted(read_blocklist_asns())} ===")
         try:
             pid, logpath = start_batch(batch_n)
