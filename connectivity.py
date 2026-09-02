@@ -193,6 +193,59 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
             )
             return "邮箱API", resp.status_code < 400, f"MailNest 站点 HTTP {resp.status_code}"
 
+        if provider == "mailpoolhub":
+            base = str(
+                config.get("mailpoolhub_api_base")
+                or "http://127.0.0.1:8080/api/v1"
+            ).rstrip("/")
+            key = str(config.get("mailpoolhub_api_key") or "").strip()
+            selected = str(config.get("mailpoolhub_provider") or "").strip()
+            if not key:
+                return "邮箱API", False, "MailPoolHub 需配置 API Key"
+            resp = http_get(
+                f"{base}/providers",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {key}"},
+                timeout=15,
+                proxies={},
+            )
+            if resp.status_code in (401, 403):
+                return "邮箱API", False, f"MailPoolHub API Key 无效 HTTP {resp.status_code}"
+            if resp.status_code >= 400:
+                return "邮箱API", False, f"MailPoolHub HTTP {resp.status_code}"
+            payload = resp.json() or {}
+            providers = payload.get("providers") if isinstance(payload, dict) else None
+            if not isinstance(providers, list):
+                return "邮箱API", False, "MailPoolHub providers 响应格式无效"
+
+            def usable(item):
+                capabilities = item.get("capabilities") or {}
+                return (
+                    item.get("healthStatus") == "healthy"
+                    and all(
+                        capabilities.get(name) is True
+                        for name in ("createMailbox", "listMessages", "getMessage")
+                    )
+                )
+
+            healthy = [item for item in providers if isinstance(item, dict) and usable(item)]
+            if selected:
+                matched = next(
+                    (
+                        item
+                        for item in providers
+                        if isinstance(item, dict) and item.get("name") == selected
+                    ),
+                    None,
+                )
+                if matched is None:
+                    return "邮箱API", False, f"MailPoolHub 内部渠道不存在: {selected}"
+                if not usable(matched):
+                    return "邮箱API", False, f"MailPoolHub 内部渠道不可用: {selected}"
+                return "邮箱API", True, f"MailPoolHub 可达；固定渠道 {selected} 健康"
+            if not healthy:
+                return "邮箱API", False, "MailPoolHub 没有具备核心能力的健康渠道"
+            return "邮箱API", True, f"MailPoolHub 可达；可自动调度 {len(healthy)} 个健康渠道"
+
         if provider == "cloudmail":
             url = str(config.get("cloudmail_url", "") or "").rstrip("/")
             if not url:

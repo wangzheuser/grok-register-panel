@@ -97,12 +97,15 @@ def test_proxy_api_auth_mutations_and_redaction():
         proxy_store.STATE_PATH,
         proxy_store.LOCK_PATH,
         proxy_store.LEGACY_PATH,
+        proxy_store.CONFIG_PATH,
     )
+    previous_resin_test = monitor.test_resin_proxy_template
     with tempfile.TemporaryDirectory() as temp:
         base_path = Path(temp)
         proxy_store.STATE_PATH = base_path / "log" / "proxy_pool.json"
         proxy_store.LOCK_PATH = base_path / "log" / "proxy_pool.json.lock"
         proxy_store.LEGACY_PATH = base_path / "proxies.txt"
+        proxy_store.CONFIG_PATH = base_path / "config.json"
         os.environ["MONITOR_TOKEN"] = token
         server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -136,6 +139,69 @@ def test_proxy_api_auth_mutations_and_redaction():
             assert secret not in body.decode("utf-8")
             assert json.loads(body)["items"][0]["has_auth"] is True
 
+            resin_secret = "resin-secret-value"
+            resin_template = f"http://temp.{{uuid}}:{resin_secret}@127.0.0.1:9200"
+            resin_payload = json.dumps(
+                {"mode": "resin", "resin_template": resin_template}
+            ).encode("utf-8")
+            status, _, _ = request(
+                base + "/api/proxies/config", method="POST", body=resin_payload
+            )
+            assert status == 401
+            status, _, body = request(
+                base + "/api/proxies/config",
+                token=token,
+                method="POST",
+                body=resin_payload,
+            )
+            assert status == 200
+            resin_state = json.loads(body)
+            assert resin_state["mode"] == "resin"
+            assert resin_state["resin"]["configured"] is True
+            assert resin_secret not in body.decode("utf-8")
+            assert "{uuid}" not in body.decode("utf-8")
+
+            status, _, body = request(
+                base + "/api/proxies/config",
+                token=token,
+                method="POST",
+                body=b'{"mode":"resin","resin_template":""}',
+            )
+            assert status == 200
+            assert json.loads(body)["resin"]["configured"] is True
+
+            monitor.test_resin_proxy_template = lambda value="": {
+                "ok": True,
+                "exit_ip": "198.51.100.44",
+                "asn": 64544,
+                "latency_ms": 44,
+                "xai_status": 200,
+                "checked_at": "2026-09-02T00:00:00Z",
+            }
+            status, _, _ = request(
+                base + "/api/proxies/resin/test",
+                method="POST",
+                body=b'{}',
+            )
+            assert status == 401
+            status, _, body = request(
+                base + "/api/proxies/resin/test",
+                token=token,
+                method="POST",
+                body=b'{}',
+            )
+            assert status == 200
+            assert json.loads(body)["xai_status"] == 200
+
+            status, _, body = request(
+                base + "/api/proxies/config",
+                token=token,
+                method="POST",
+                body=b'{"mode":"direct","clear_resin_template":true}',
+            )
+            assert status == 200
+            assert json.loads(body)["resin"]["configured"] is False
+
             status, _, body = request(
                 base + f"/api/proxies/{proxy_id}",
                 token=token,
@@ -161,7 +227,13 @@ def test_proxy_api_auth_mutations_and_redaction():
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
-            proxy_store.STATE_PATH, proxy_store.LOCK_PATH, proxy_store.LEGACY_PATH = previous_paths
+            (
+                proxy_store.STATE_PATH,
+                proxy_store.LOCK_PATH,
+                proxy_store.LEGACY_PATH,
+                proxy_store.CONFIG_PATH,
+            ) = previous_paths
+            monitor.test_resin_proxy_template = previous_resin_test
             if previous_token is None:
                 os.environ.pop("MONITOR_TOKEN", None)
             else:

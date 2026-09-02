@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -22,14 +23,21 @@ class IsolatedStore:
             proxy_store.STATE_PATH,
             proxy_store.LOCK_PATH,
             proxy_store.LEGACY_PATH,
+            proxy_store.CONFIG_PATH,
         )
         proxy_store.STATE_PATH = base / "log" / "proxy_pool.json"
         proxy_store.LOCK_PATH = base / "log" / "proxy_pool.json.lock"
         proxy_store.LEGACY_PATH = base / "proxies.txt"
+        proxy_store.CONFIG_PATH = base / "config.json"
         return base
 
     def __exit__(self, exc_type, exc, tb):
-        proxy_store.STATE_PATH, proxy_store.LOCK_PATH, proxy_store.LEGACY_PATH = self.previous
+        (
+            proxy_store.STATE_PATH,
+            proxy_store.LOCK_PATH,
+            proxy_store.LEGACY_PATH,
+            proxy_store.CONFIG_PATH,
+        ) = self.previous
         self.temp.cleanup()
 
 
@@ -76,7 +84,8 @@ def test_import_deduplicates_and_public_view_never_leaks_credentials():
         assert result["items"][0]["has_auth"] is True
         stored = proxy_store.STATE_PATH.read_text(encoding="utf-8")
         assert secret in stored
-        assert stat.S_IMODE(proxy_store.STATE_PATH.stat().st_mode) == 0o600
+        if os.name == "posix":
+            assert stat.S_IMODE(proxy_store.STATE_PATH.stat().st_mode) == 0o600
 
 
 def test_probe_result_and_runtime_cooldown_control_worker_selection():
@@ -170,10 +179,147 @@ def test_async_probe_job_persists_health():
             proxy_store.probe_proxy = previous_probe
 
 
+def test_resin_template_validation_and_materialization():
+    template = "http://node.{uuid}:pass@127.0.0.1:9200"
+    assert proxy_store.normalize_resin_template(template) == template
+    first = proxy_store.materialize_resin_template(template)
+    second = proxy_store.materialize_resin_template(template)
+    assert "{uuid}" not in first
+    assert first != second
+    assert first.endswith(":pass@127.0.0.1:9200")
+
+    for invalid in (
+        "http://node.static:pass@127.0.0.1:9200",
+        "http://node.{uuid}.{uuid}:pass@127.0.0.1:9200",
+        "http://node:{uuid}@127.0.0.1:9200",
+        "http://node.user:pass@{uuid}:9200",
+        "http://node.{uuid}@127.0.0.1:9200",
+        "http://node.{uuid}:pass@127.0.0.1:99999",
+        "http://node.{uuid}:pass@127.0.0.1:9200/path",
+    ):
+        try:
+            proxy_store.normalize_resin_template(invalid)
+        except proxy_store.ProxyValidationError:
+            pass
+        else:
+            raise AssertionError(f"invalid Resin template accepted: {invalid}")
+
+
+def test_resin_mode_save_mask_preserve_clear_and_strict_pool():
+    template = "http://node.{uuid}:secret-pass@127.0.0.1:9200"
+    with IsolatedStore():
+        saved = proxy_store.save_proxy_config("resin", resin_template=template)
+        assert saved["mode"] == "resin"
+        assert saved["mode_explicit"] is True
+        assert saved["resin"]["configured"] is True
+        assert "secret-pass" not in json.dumps(saved)
+        assert "{uuid}" not in saved["resin"]["display_url"]
+        raw = json.loads(proxy_store.STATE_PATH.read_text(encoding="utf-8"))
+        assert raw["resin"]["template"] == template
+
+        preserved = proxy_store.save_proxy_config("resin", resin_template="")
+        assert preserved["resin"]["configured"] is True
+        snapshot = proxy_store.worker_proxy_snapshot()
+        assert snapshot["mode"] == "resin"
+        assert snapshot["resin_template"] == template
+
+        pool = proxy_store.save_proxy_config("pool")
+        assert pool["mode"] == "pool"
+        snapshot = proxy_store.worker_proxy_snapshot()
+        assert snapshot["configured"] is True
+        assert snapshot["urls"] == []
+
+        cleared = proxy_store.save_proxy_config("direct", clear_resin_template=True)
+        assert cleared["mode"] == "direct"
+        assert cleared["resin"]["configured"] is False
+
+
+def test_legacy_proxy_source_inference():
+    with IsolatedStore():
+        proxy_store.CONFIG_PATH.write_text(
+            json.dumps({"proxy": "http://temp.{uuid}:pass@127.0.0.1:9200"}),
+            encoding="utf-8",
+        )
+        state = proxy_store.read_proxy_pool()
+        assert state["mode"] == "resin"
+        assert state["mode_explicit"] is False
+        assert state["resin"]["configured"] is True
+
+    with IsolatedStore():
+        proxy_store.CONFIG_PATH.write_text(
+            json.dumps({"proxy": "http://127.0.0.1:7890"}), encoding="utf-8"
+        )
+        state = proxy_store.read_proxy_pool()
+        assert state["mode"] == "pool"
+        assert state["mode_explicit"] is False
+
+    with IsolatedStore():
+        state = proxy_store.read_proxy_pool()
+        assert state["mode"] == "direct"
+        assert state["mode_explicit"] is False
+
+
+def test_resin_runtime_result_is_aggregate_only():
+    with IsolatedStore():
+        proxy_store.save_proxy_config(
+            "resin",
+            resin_template="http://temp.{uuid}:pass@127.0.0.1:9200",
+        )
+        assert proxy_store.record_resin_result("success") is True
+        assert proxy_store.record_resin_result("risk", "challenge") is True
+        state = proxy_store.read_proxy_pool()
+        assert state["summary"]["total"] == 0
+        assert state["resin"]["success_count"] == 1
+        assert state["resin"]["failure_count"] == 1
+        assert state["resin"]["risk_count"] == 1
+
+
+def test_resin_template_probe_uses_concrete_uuid_and_persists_summary(monkeypatch):
+    concrete_urls = []
+
+    def fake_probe(url, timeout=8):
+        concrete_urls.append(url)
+        return {
+            "ok": True,
+            "exit_ip": "198.51.100.55",
+            "asn": 64555,
+            "asn_org": "Resin Test",
+            "latency_ms": 55,
+            "checked_at": "2026-09-02T00:00:00Z",
+        }
+
+    class Response:
+        status_code = 200
+        text = "signup"
+        headers = {}
+
+    from curl_cffi import requests as curl_requests
+
+    monkeypatch.setattr(proxy_store, "probe_proxy", fake_probe)
+    monkeypatch.setattr(curl_requests, "get", lambda *_args, **_kwargs: Response())
+    with IsolatedStore():
+        template = "http://temp.{uuid}:pass@127.0.0.1:9200"
+        proxy_store.save_proxy_config("resin", resin_template=template)
+        result = proxy_store.test_resin_proxy_template()
+        assert result["ok"] is True
+        assert result["xai_status"] == 200
+        assert len(concrete_urls) == 1
+        assert "{uuid}" not in concrete_urls[0]
+        assert "pass" not in json.dumps(result)
+        public = proxy_store.read_proxy_pool()["resin"]
+        assert public["status"] == "healthy"
+        assert public["exit_ip"] == "198.51.100.55"
+        assert public["xai_status"] == 200
+
+
 if __name__ == "__main__":
     test_normalize_proxy_formats_and_rejects_paths()
     test_import_deduplicates_and_public_view_never_leaks_credentials()
     test_probe_result_and_runtime_cooldown_control_worker_selection()
     test_disable_delete_and_legacy_import()
     test_async_probe_job_persists_health()
+    test_resin_template_validation_and_materialization()
+    test_resin_mode_save_mask_preserve_clear_and_strict_pool()
+    test_legacy_proxy_source_inference()
+    test_resin_runtime_result_is_aggregate_only()
     print("OK proxy store")

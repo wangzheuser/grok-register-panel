@@ -54,9 +54,15 @@ def test_provider_schema_and_defaults():
             "mailnest",
             "cloudmail",
             "moemail",
+            "mailpoolhub",
         }
         assert providers["duckmail"]["configured"] is True
         assert providers["cloudmail"]["configured"] is False
+        assert providers["mailpoolhub"]["configured"] is False
+        assert any(
+            field["name"] == "mailpoolhub_api_key" and field["secret"] is True
+            for field in providers["mailpoolhub"]["fields"]
+        )
         assert any(
             field["name"] == "cloudmail_password" and field["secret"] is True
             for field in providers["cloudmail"]["fields"]
@@ -185,10 +191,74 @@ def test_cloudflare_connectivity_uses_configured_port():
     assert calls == [("mail.example.com", 8793)]
 
 
+def test_mailpoolhub_secret_and_connectivity_validation():
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "providers": [
+                    {
+                        "name": "mailgw",
+                        "healthStatus": "healthy",
+                        "capabilities": {
+                            "createMailbox": True,
+                            "listMessages": True,
+                            "getMessage": True,
+                        },
+                    }
+                ]
+            }
+
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    with IsolatedConfig() as config_path:
+        saved = email_provider_store.save_email_provider_config(
+            "mailpoolhub",
+            {
+                "mailpoolhub_api_base": "http://127.0.0.1:8080/api/v1/",
+                "mailpoolhub_api_key": "mph_live_secret",
+                "mailpoolhub_provider": "",
+            },
+        )
+        assert saved["configured"] is True
+        assert saved["values"]["mailpoolhub_api_key"] == ""
+        assert saved["secret_configured"]["mailpoolhub_api_key"] is True
+        assert "mph_live_secret" not in json.dumps(saved)
+        assert json.loads(config_path.read_text(encoding="utf-8"))["mailpoolhub_api_key"] == "mph_live_secret"
+
+        result = email_provider_store.test_email_provider_config(
+            "mailpoolhub",
+            {
+                "mailpoolhub_api_base": "http://127.0.0.1:8080/api/v1",
+                "mailpoolhub_api_key": "",
+                "mailpoolhub_provider": "MailGW",
+            },
+            http_get=fake_get,
+            http_post=lambda *_args, **_kwargs: Response(),
+        )
+        assert result["ok"] is True
+        assert "固定渠道 mailgw 健康" in result["detail"]
+        assert calls[0][0].endswith("/providers")
+        assert calls[0][1]["headers"]["Authorization"] == "Bearer mph_live_secret"
+
+        assert_config_error(
+            lambda: email_provider_store.save_email_provider_config(
+                "mailpoolhub", {"mailpoolhub_provider": "bad/provider"}
+            )
+        )
+
+
 if __name__ == "__main__":
     test_provider_schema_and_defaults()
     test_secret_masking_preservation_clear_and_private_file()
     test_validation_rejects_unknown_fields_and_unsafe_values()
     test_connectivity_uses_unsaved_form_and_preserves_saved_secret()
     test_cloudflare_connectivity_uses_configured_port()
+    test_mailpoolhub_secret_and_connectivity_validation()
     print("OK email provider store")

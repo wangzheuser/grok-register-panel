@@ -27,7 +27,9 @@ try:
         import_legacy_proxies,
         import_proxies,
         read_proxy_pool,
+        save_proxy_config,
         start_proxy_tests,
+        test_resin_proxy_template,
         update_proxy,
     )
     from webui.email_domain_store import (
@@ -63,7 +65,9 @@ except ImportError:  # running as script from webui/
         import_legacy_proxies,
         import_proxies,
         read_proxy_pool,
+        save_proxy_config,
         start_proxy_tests,
+        test_resin_proxy_template,
         update_proxy,
     )
     from email_domain_store import (  # type: ignore
@@ -636,7 +640,7 @@ def _start_orch_unlocked():
     fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.fchmod(fd, 0o600)
-    except OSError:
+    except (AttributeError, OSError):
         pass
     stdout = os.fdopen(fd, "a", encoding="utf-8")
     stdout.write(
@@ -697,7 +701,7 @@ def _start_batch_only_unlocked():
     fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.fchmod(fd, 0o600)
-    except OSError:
+    except (AttributeError, OSError):
         pass
     fout = os.fdopen(fd, "w", encoding="utf-8")
     
@@ -1298,6 +1302,15 @@ HTML = r"""<!DOCTYPE html>
   .proxy-toggle { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-empty { padding: 38px 18px !important; color: var(--muted); text-align: center; }
   .proxy-job { color: var(--muted); font-size: 11px; }
+  .proxy-mode-bar { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin-bottom: 16px; padding: 14px; border: 1px solid var(--border); background: var(--surface-raised); }
+  .proxy-mode-bar .field { min-width: 220px; margin: 0; }
+  .proxy-source-panel { margin-bottom: 16px; padding: 16px; border: 1px solid var(--border); background: var(--surface); }
+  .proxy-source-panel p { margin: 0; color: var(--muted); line-height: 1.6; }
+  .resin-config-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 14px; }
+  .resin-status { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: 14px; border: 1px solid var(--border); background: var(--border); }
+  .resin-status-item { min-width: 0; padding: 10px 12px; background: var(--surface-raised); }
+  .resin-status-label { color: var(--muted); font-size: 10px; }
+  .resin-status-value { margin-top: 4px; overflow-wrap: anywhere; font-size: 12px; }
   body.domain-view-open { overflow: hidden; }
   body.domain-view-open #dashboard-view > :not(#domain-view) { display: none; }
   .domain-view {
@@ -1641,6 +1654,8 @@ HTML = r"""<!DOCTYPE html>
     .proxy-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .proxy-summary-item:last-child { grid-column: 1 / -1; }
     .proxy-import { grid-template-columns: minmax(0, 1fr); }
+    .proxy-mode-bar, .resin-config-grid { align-items: stretch; grid-template-columns: minmax(0, 1fr); flex-direction: column; }
+    .resin-status { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .proxy-import-actions .button-group { justify-content: stretch; }
     .proxy-import-actions button { flex: 1 1 auto; }
     .proxy-list-head { align-items: flex-start; flex-direction: column; }
@@ -1925,7 +1940,38 @@ HTML = r"""<!DOCTYPE html>
         <span class="proxy-job mono" id="proxy-updated">等待读取</span>
       </div>
 
-      <div class="proxy-summary" id="proxy-summary" aria-label="代理池状态">
+      <div class="proxy-mode-bar">
+        <div class="field">
+          <label for="proxy-mode-select">代理来源模式</label>
+          <select id="proxy-mode-select" onchange="selectProxyMode(this.value)">
+            <option value="direct">直连</option>
+            <option value="pool">静态代理池</option>
+            <option value="resin">Resin UUID 模板</option>
+          </select>
+        </div>
+        <button class="primary" id="proxy-mode-save" onclick="saveProxyMode()">保存来源配置</button>
+      </div>
+
+      <section class="proxy-source-panel" id="proxy-direct-panel" hidden>
+        <p>直连模式不会使用静态代理池、proxies.txt、config.proxy 或 Resin 模板。</p>
+      </section>
+
+      <section class="proxy-source-panel" id="proxy-resin-panel" hidden>
+        <div class="resin-config-grid">
+          <div class="field">
+            <label for="resin-template-input">Resin 代理模板</label>
+            <input id="resin-template-input" type="password" autocomplete="new-password" placeholder="http://node.{uuid}:password@127.0.0.1:9200"/>
+          </div>
+          <div class="button-group">
+            <button id="resin-test-button" onclick="testResinTemplate()">测试模板</button>
+            <button class="danger" id="resin-clear-button" onclick="clearResinTemplate()">清除模板</button>
+          </div>
+        </div>
+        <p id="resin-template-note">输入框留空会保留已保存模板；测试不会保存新模板。</p>
+        <div class="resin-status" id="resin-status" aria-live="polite"></div>
+      </section>
+
+      <div class="proxy-summary proxy-pool-only" id="proxy-summary" aria-label="代理池状态">
         <div class="proxy-summary-item"><div class="proxy-summary-label">总数</div><div class="proxy-summary-value">--</div></div>
         <div class="proxy-summary-item"><div class="proxy-summary-label">可用</div><div class="proxy-summary-value">--</div></div>
         <div class="proxy-summary-item"><div class="proxy-summary-label">异常</div><div class="proxy-summary-value">--</div></div>
@@ -1933,7 +1979,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="proxy-summary-item"><div class="proxy-summary-label">未检测</div><div class="proxy-summary-value">--</div></div>
       </div>
 
-      <div class="proxy-import">
+      <div class="proxy-import proxy-pool-only">
         <div class="field">
           <label for="proxy-input">代理地址（每行一条）</label>
           <textarea id="proxy-input" spellcheck="false" autocomplete="off" placeholder="http://user:password@host:port&#10;host:port:user:password"></textarea>
@@ -1948,7 +1994,7 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div class="msg" id="proxy-msg" role="status" aria-live="polite"></div>
 
-      <div class="proxy-list-section">
+      <div class="proxy-list-section proxy-pool-only">
         <div class="proxy-list-head">
           <div>
             <h2>代理明细</h2>
@@ -2169,6 +2215,7 @@ HTML = r"""<!DOCTYPE html>
 <script>
 let last = null;
 let proxyData = null;
+let clearResinTemplatePending = false;
 let domainData = null;
 let emailProviderData = null;
 let selectedEmailProvider = "";
@@ -2386,6 +2433,73 @@ function cooldownText(item) {
   const value = seconds >= 3600 ? Math.ceil(seconds / 3600) + " 小时" : Math.ceil(seconds / 60) + " 分钟";
   return (item.cooldown_reason === "risk" ? "风控冷却 " : "网络冷却 ") + value;
 }
+function selectProxyMode(mode) {
+  const selected = ["direct", "pool", "resin"].includes(mode) ? mode : "direct";
+  document.querySelectorAll(".proxy-pool-only").forEach(node => { node.hidden = selected !== "pool"; });
+  document.getElementById("proxy-direct-panel").hidden = selected !== "direct";
+  document.getElementById("proxy-resin-panel").hidden = selected !== "resin";
+}
+function renderResinStatus(resin) {
+  const data = resin || {};
+  const status = proxyStatusLabel(data.status || "unknown");
+  const endpoint = data.configured ? (data.display_url || "凭据已隐藏") : "未配置";
+  const exit = data.exit_ip || "--";
+  const asn = data.asn ? ("AS" + data.asn) : "--";
+  const latency = data.latency_ms == null ? "--" : (data.latency_ms + " ms");
+  const xai = data.xai_status ? ("HTTP " + data.xai_status) : "--";
+  document.getElementById("resin-status").innerHTML = [
+    ["模板", endpoint],
+    ["状态", status + (data.last_error ? (" · " + data.last_error) : "")],
+    ["出口 / ASN", exit + " / " + asn],
+    ["延迟 / xAI", latency + " / " + xai],
+  ].map(([label, value]) => `<div class="resin-status-item"><div class="resin-status-label">${esc(label)}</div><div class="resin-status-value mono">${esc(value)}</div></div>`).join("");
+  document.getElementById("resin-template-note").textContent = data.configured
+    ? "已保存模板；输入框留空会保留现值。成功 " + (data.success_count || 0) + " / 失败 " + (data.failure_count || 0) + " / 风控 " + (data.risk_count || 0)
+    : "尚未保存模板；必须且只能在用户名中包含一个 {uuid}。";
+  document.getElementById("resin-clear-button").disabled = !data.configured;
+}
+async function saveProxyMode() {
+  const button = document.getElementById("proxy-mode-save");
+  const mode = document.getElementById("proxy-mode-select").value;
+  const template = (document.getElementById("resin-template-input").value || "").trim();
+  button.disabled = true;
+  setMsg("proxy-msg", "正在保存代理来源…", "");
+  try {
+    const result = await api("/api/proxies/config", { method: "POST", body: JSON.stringify({
+      mode,
+      resin_template: template,
+      clear_resin_template: clearResinTemplatePending,
+    }) });
+    clearResinTemplatePending = false;
+    document.getElementById("resin-template-input").value = "";
+    renderProxyPool(result);
+    setMsg("proxy-msg", "代理来源配置已保存", "ok");
+  } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+async function testResinTemplate() {
+  const button = document.getElementById("resin-test-button");
+  const template = (document.getElementById("resin-template-input").value || "").trim();
+  button.disabled = true;
+  setMsg("proxy-msg", "正在使用临时 UUID 测试 Resin…", "");
+  try {
+    const result = await api("/api/proxies/resin/test", { method: "POST", body: JSON.stringify({ resin_template: template }) });
+    const detail = "Resin 可用，出口 " + (result.exit_ip || "--") + "，xAI HTTP " + (result.xai_status || "--");
+    setMsg("proxy-msg", detail, "ok");
+    if (!template) await refreshProxies(false);
+  } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+async function clearResinTemplate() {
+  if (!confirm("清除已保存的 Resin 模板？当前为 Resin 模式时将同时切换为直连。")) return;
+  clearResinTemplatePending = true;
+  document.getElementById("resin-template-input").value = "";
+  if (document.getElementById("proxy-mode-select").value === "resin") {
+    document.getElementById("proxy-mode-select").value = "direct";
+    selectProxyMode("direct");
+  }
+  await saveProxyMode();
+}
 function renderProxyPool(data) {
   proxyData = data || {};
   const summary = proxyData.summary || {};
@@ -2399,7 +2513,12 @@ function renderProxyPool(data) {
   document.getElementById("proxy-summary").innerHTML = values.map(([label, value, cls]) =>
     `<div class="proxy-summary-item"><div class="proxy-summary-label">${esc(label)}</div><div class="proxy-summary-value ${cls}">${esc(value)}</div></div>`
   ).join("");
-  document.getElementById("proxy-updated").textContent = proxyData.updated_at ? ("更新 " + proxyTime(proxyData.updated_at)) : "尚未写入";
+  document.getElementById("proxy-updated").textContent = proxyData.updated_at
+    ? ("更新 " + proxyTime(proxyData.updated_at) + (proxyData.mode_explicit ? "" : " · 兼容推断"))
+    : "尚未写入";
+  document.getElementById("proxy-mode-select").value = proxyData.mode || "direct";
+  selectProxyMode(proxyData.mode || "direct");
+  renderResinStatus(proxyData.resin || {});
 
   const legacy = proxyData.legacy || {};
   const legacyButton = document.getElementById("proxy-legacy-button");
@@ -3290,6 +3409,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(code, result)
             except Exception as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/proxies/config":
+            try:
+                result = save_proxy_config(
+                    body.get("mode"),
+                    resin_template=body.get("resin_template") or "",
+                    clear_resin_template=body.get("clear_resin_template", False),
+                )
+                self._json(200, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/proxies/resin/test":
+            try:
+                result = test_resin_proxy_template(body.get("resin_template") or "")
+                self._json(200 if result.get("ok") else 424, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/email-provider":
             try:

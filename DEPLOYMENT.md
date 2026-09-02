@@ -42,12 +42,28 @@ chmod 600 config.json
 原值，只有显式点“清除”并保存才会删除。连接测试使用当前表单内容但不会落盘。
 配置仍写入 `config.json`，原子更新并保持 `0600`，其它已有配置项不会被覆盖。
 
+使用独立部署的 MailPoolHub 时配置：
+
+- `email_provider`: `mailpoolhub`
+- `mailpoolhub_api_base`: MailPoolHub `/api/v1` 地址
+- `mailpoolhub_api_key`: 管理后台创建的客户端 API Key
+- `mailpoolhub_provider`: 留空自动调度；填写 `mailgw` 等名称可固定内部渠道
+
+启动注册任务前应通过面板连接测试确认 MailPoolHub 可达且至少有一个健康渠道。
+注册面板不管理 MailPoolHub 服务生命周期，MailPoolHub API 请求也不使用注册代理。
+
 代理池与 sticky 文件均属于凭据材料。运行权限脚本会将 `proxies*.txt`、
 `stickies*.txt`、缓存文件及 `.env.monitor` 收紧为 `0600`。
 
 面板“代理池”会把真实代理 URL 写入 `log/proxy_pool.json`，文件权限为 `0600`。
 导入后先完成探活；有面板池条目时 worker 只使用健康且启用的代理，全部异常或
 冷却时会停止对应任务。一个账号开始后，注册、SSO 与 OAuth 全程固定同一出口。
+
+Resin V1 正向代理可在同一文件中保存为 UUID 模板，例如
+`http://temp.{uuid}:proxy-token@127.0.0.1:9200`。`{uuid}` 只能位于用户名部分；
+每个账号或重试都会实例化新 UUID，同一账号内保持固定。代理来源模式为
+`direct`、`pool` 或 `resin`，显式保存后严格互斥，不会因静态代理池存在而覆盖 Resin。
+面板不会连接 Resin 管理员 API，也不会负责启动或停止 Resin 服务。
 
 面板“邮箱服务”里的“域名轮换 · 高级设置”会把域名、provider、拒绝计数和轮换规则写入
 `log/email_domain_pool.json`，文件权限为 `0600`。只有 xAI 明确拒绝邮箱域名时

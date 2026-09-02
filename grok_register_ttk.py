@@ -23,6 +23,7 @@ import re
 import string
 import json
 import base64
+import uuid
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -35,6 +36,7 @@ import sso_to_auth_json as _s2cpa
 from email_providers import cloudflare as cloudflare_provider
 from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
+from email_providers import mailpoolhub as mailpoolhub_provider
 from email_providers import mailnest as mailnest_provider
 from email_providers import moemail as moemail_provider
 from email_providers import yyds as yyds_provider
@@ -56,7 +58,11 @@ from secure_files import (
 )
 from webui.proxy_store import (
     mark_proxy_used as _mark_managed_proxy_used,
+    read_proxy_pool as _read_proxy_source_config,
     record_proxy_result as _record_managed_proxy_result,
+    record_resin_result as _record_resin_proxy_result,
+    save_proxy_config as _save_proxy_source_config,
+    test_resin_proxy_template as _test_resin_proxy_template,
     worker_proxy_snapshot as _managed_worker_proxy_snapshot,
 )
 from webui.email_domain_store import (
@@ -222,6 +228,9 @@ DEFAULT_CONFIG = {
     "grok2api_auth_dir": "grok2api_auth",
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
+    "mailpoolhub_api_base": "http://127.0.0.1:8080/api/v1",
+    "mailpoolhub_api_key": "",
+    "mailpoolhub_provider": "",
     # YYDS：留空自动选已验证域名；填写则固定该域名
     "yyds_default_domain": "",
     # MoeMail：站点根 URL + X-API-Key；域名留空时从 /api/config 自动选择
@@ -362,12 +371,17 @@ def record_register_result(
     except Exception:
         pass
     try:
+        recorder = (
+            _record_resin_proxy_result
+            if globals().get("_proxy_pool_source") == "resin"
+            else lambda outcome, error="": _record_managed_proxy_result(proxy, outcome, error)
+        )
         if status == "ok":
-            _record_managed_proxy_result(proxy, "success")
+            recorder("success")
         elif status == "risk" or kind == FAIL_RISK:
-            _record_managed_proxy_result(proxy, "risk", detail)
+            recorder("risk", detail)
         elif kind == FAIL_BROWSER:
-            _record_managed_proxy_result(proxy, "network", detail)
+            recorder("network", detail)
     except Exception:
         pass
     # 从 proxy URL 抽端口
@@ -573,8 +587,21 @@ def load_proxy_pool(path: str = "") -> list:
         managed_snapshot = _managed_worker_proxy_snapshot()
     except Exception:
         managed_snapshot = {"configured": False, "urls": []}
+    mode = str(managed_snapshot.get("mode") or "").strip().lower()
+    mode_explicit = bool(managed_snapshot.get("mode_explicit"))
     managed = list(managed_snapshot.get("urls") or [])
-    if managed_snapshot.get("configured"):
+    if mode == "direct":
+        with _proxy_pool_lock:
+            _proxy_pool = []
+            _proxy_pool_source = "direct"
+            return []
+    if mode == "resin":
+        template = str(managed_snapshot.get("resin_template") or "").strip()
+        with _proxy_pool_lock:
+            _proxy_pool = [template] if template else []
+            _proxy_pool_source = "resin" if template else "resin-empty"
+            return list(_proxy_pool)
+    if mode == "pool" and (mode_explicit or managed_snapshot.get("pool_configured")):
         with _proxy_pool_lock:
             _proxy_pool = managed
             _proxy_pool_source = "managed" if managed else "managed-empty"
@@ -611,33 +638,63 @@ def load_proxy_pool(path: str = "") -> list:
 
 def set_thread_proxy(proxy: str):
     _proxy_tls.proxy = str(proxy or "").strip()
+    _proxy_tls.proxy_assigned = True
 
 
 def get_thread_proxy() -> str:
     return str(getattr(_proxy_tls, "proxy", "") or "").strip()
 
 
+def materialize_proxy_template(proxy: str) -> str:
+    value = str(proxy or "").strip()
+    return value.replace("{uuid}", str(uuid.uuid4()))
+
+
 def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
     """账号边界热加载，全池轮换；当前浏览器会话内不再换代理。"""
     pool = load_proxy_pool()
     if not pool:
+        if _proxy_pool_source == "direct":
+            return ""
+        if _proxy_pool_source == "resin-empty":
+            raise RuntimeError("Resin 模式尚未配置有效代理模板")
         if _proxy_pool_source == "managed-empty":
             raise RuntimeError("面板代理池没有健康且启用的代理，请先检测或等待冷却结束")
-        return str(config.get("proxy", "") or "").strip()
+        return materialize_proxy_template(config.get("proxy", ""))
     idx = (max(0, int(worker_id)) + max(0, int(rotate_idx))) % len(pool)
     selected = pool[idx]
-    try:
-        _mark_managed_proxy_used(selected)
-    except Exception:
-        pass
-    return selected
+    if _proxy_pool_source == "managed":
+        try:
+            _mark_managed_proxy_used(selected)
+        except Exception:
+            pass
+    return materialize_proxy_template(selected)
 
 
 def get_proxies():
-    proxy = get_thread_proxy() or str(config.get("proxy", "") or "").strip()
+    if getattr(_proxy_tls, "proxy_assigned", False):
+        proxy = get_thread_proxy()
+    else:
+        proxy = str(config.get("proxy", "") or "").strip()
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def connectivity_config_for_current_proxy() -> dict:
+    candidate = dict(config)
+    pool = load_proxy_pool()
+    if _proxy_pool_source == "direct":
+        candidate["proxy"] = ""
+    elif pool:
+        candidate["proxy"] = materialize_proxy_template(pool[0])
+    elif _proxy_pool_source == "resin-empty":
+        raise RuntimeError("Resin 模式尚未配置有效代理模板")
+    elif _proxy_pool_source == "managed-empty":
+        raise RuntimeError("静态代理池没有健康且启用的代理")
+    else:
+        candidate["proxy"] = materialize_proxy_template(config.get("proxy", ""))
+    return candidate
 
 
 def record_proxy_boot_failure(proxy: str, exc) -> None:
@@ -645,12 +702,18 @@ def record_proxy_boot_failure(proxy: str, exc) -> None:
     message = str(exc or "")
     outcome = "risk" if ("黑名单" in message or "policy=deny" in message) else "network"
     try:
-        _record_managed_proxy_result(proxy, outcome, message)
+        if _proxy_pool_source == "resin":
+            _record_resin_proxy_result(outcome, message)
+        else:
+            _record_managed_proxy_result(proxy, outcome, message)
     except Exception:
         pass
 
 
 _MAIL_DIRECT_MARKERS = (
+    "127.0.0.1:8080/api/v1",
+    "api.duckmail.sbs",
+    "api.mail.tm",
     "mail-api.example.com",
     "hermaly.com",
     "example.com",
@@ -681,6 +744,18 @@ def get_duckmail_api_base():
 
 def get_duckmail_api_key():
     return config.get("duckmail_api_key", "")
+
+
+def get_mailpoolhub_api_base():
+    return mailpoolhub_provider.normalize_base(config.get("mailpoolhub_api_base", ""))
+
+
+def get_mailpoolhub_api_key():
+    return str(config.get("mailpoolhub_api_key", "") or "").strip()
+
+
+def get_mailpoolhub_provider():
+    return str(config.get("mailpoolhub_provider", "") or "").strip().lower()
 
 
 
@@ -1050,36 +1125,36 @@ def _build_request_kwargs(**kwargs):
     return request_kwargs
 
 
+def _direct_request(method, url, kwargs):
+    request_kwargs = dict(kwargs)
+    request_kwargs.pop("proxies", None)
+    request_kwargs.pop("impersonate", None)
+    request_kwargs.setdefault("timeout", 20)
+    with _std_requests.Session() as session:
+        session.trust_env = False
+        return session.request(method, url, **request_kwargs)
+
+
 def http_get(url, **kwargs):
     allow_direct_fallback = bool(kwargs.pop("_allow_direct_fallback", True))
-    if _url_needs_direct(url):
-        rk = dict(kwargs)
-        rk.pop("proxies", None)
-        rk.setdefault("timeout", 20)
-        clean = {k: v for k, v in rk.items() if k != "impersonate"}
-        return _std_requests.get(url, proxies={}, **clean)
+    force_direct = bool(kwargs.pop("_force_direct", False))
+    if force_direct or _url_needs_direct(url):
+        return _direct_request("GET", url, kwargs)
     try:
         rk = _build_request_kwargs(**kwargs)
         return requests.get(url, **rk)
     except Exception as exc:
         err = str(exc)
         if allow_direct_fallback and any(x in err for x in ("Could not connect", "TLS connect error", "OPENSSL_internal", "7890")):
-            rk = dict(kwargs)
-            rk.pop("proxies", None)
-            rk.setdefault("timeout", 20)
-            clean = {k: v for k, v in rk.items() if k != "impersonate"}
-            return _std_requests.get(url, proxies={}, **clean)
+            return _direct_request("GET", url, kwargs)
         raise
 
 
 
 def http_post(url, **kwargs):
-    if _url_needs_direct(url):
-        rk = dict(kwargs)
-        rk.pop("proxies", None)
-        rk.setdefault("timeout", 20)
-        clean = {k: v for k, v in rk.items() if k != "impersonate"}
-        return _std_requests.post(url, proxies={}, **clean)
+    force_direct = bool(kwargs.pop("_force_direct", False))
+    if force_direct or _url_needs_direct(url):
+        return _direct_request("POST", url, kwargs)
     try:
         rk = _build_request_kwargs(**kwargs)
         if "_apply_mail_direct" in globals():
@@ -1088,16 +1163,15 @@ def http_post(url, **kwargs):
     except Exception as exc:
         err = str(exc)
         if any(x in err for x in ("Could not connect", "TLS connect error", "OPENSSL_internal", "7890")):
-            rk = dict(kwargs)
-            rk.pop("proxies", None)
-            rk.setdefault("timeout", 20)
-            clean = {k: v for k, v in rk.items() if k != "impersonate"}
-            return _std_requests.post(url, proxies={}, **clean)
+            return _direct_request("POST", url, kwargs)
         raise
 
 
 
 def http_delete(url, **kwargs):
+    force_direct = bool(kwargs.pop("_force_direct", False))
+    if force_direct or _url_needs_direct(url):
+        return _direct_request("DELETE", url, kwargs)
     try:
         rk = _apply_mail_direct(url, _build_request_kwargs(**kwargs))
         return requests.delete(url, **rk)
@@ -1570,6 +1644,14 @@ def get_email_and_token(api_key=None):
                 raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
     if provider == "mailnest":
         return mailnest_buy_email(), "_"
+    if provider == "mailpoolhub":
+        return mailpoolhub_provider.create_mailbox(
+            http_post,
+            get_mailpoolhub_api_base(),
+            api_key or get_mailpoolhub_api_key(),
+            provider=get_mailpoolhub_provider(),
+            ttl_seconds=900,
+        )
     return duckmail_provider.create_mailbox(
         http_get,
         http_post,
@@ -1634,6 +1716,22 @@ def get_oai_code(
             email,
             timeout=timeout,
             poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    if provider == "mailpoolhub":
+        return mailpoolhub_provider.wait_for_code(
+            http_get,
+            http_delete,
+            get_mailpoolhub_api_base(),
+            get_mailpoolhub_api_key(),
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=max(5, poll_interval),
+            extract_code=extract_verification_code,
+            raise_if_cancelled=raise_if_cancelled,
+            sleep_with_cancel=sleep_with_cancel,
             log_callback=log_callback,
             cancel_callback=cancel_callback,
         )
@@ -2340,7 +2438,7 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["duckmail", "yyds", "cloudflare", "mailnest", "cloudmail", "moemail"],
+            ["duckmail", "yyds", "cloudflare", "mailnest", "mailpoolhub", "cloudmail", "moemail"],
             width=12,
         )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
@@ -2379,10 +2477,25 @@ class GrokRegisterGUI:
         self.log_level_combo = tk_option_menu(opt_frame, self.log_level_var, ["info", "debug"], width=6)
         self.log_level_combo.pack(side=tk.LEFT)
 
-        add_label(1, 2, "代理（可选）:")
+        try:
+            proxy_source_state = _read_proxy_source_config()
+        except Exception:
+            proxy_source_state = {"mode": "pool", "resin": {"configured": False}}
+        proxy_mode_display = {
+            "direct": "直连",
+            "pool": "静态代理池",
+            "resin": "Resin UUID",
+        }.get(str(proxy_source_state.get("mode") or "pool"), "静态代理池")
+        add_label(1, 2, "代理来源:")
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
-        self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
-        add_field(self.proxy_entry, 1, 3)
+        self.proxy_mode_var = tk.StringVar(value=proxy_mode_display)
+        self.proxy_mode_combo = tk_option_menu(
+            config_frame,
+            self.proxy_mode_var,
+            ["直连", "静态代理池", "Resin UUID"],
+            width=14,
+        )
+        add_field(self.proxy_mode_combo, 1, 3, sticky=tk.W)
 
         # 服务商专属配置（按选择显示）
         self.provider_frame = tk.LabelFrame(
@@ -2511,6 +2624,53 @@ class GrokRegisterGUI:
             p_field(tk_entry(self.provider_frame, textvariable=self.mailnest_project_code_var, width=34), 0, 3),
         ]
 
+        # MailPoolHub
+        self.mailpoolhub_api_base_var = tk.StringVar(
+            value=str(
+                config.get("mailpoolhub_api_base")
+                or "http://127.0.0.1:8080/api/v1"
+            )
+        )
+        self.mailpoolhub_api_key_var = tk.StringVar(
+            value=str(config.get("mailpoolhub_api_key", "") or "")
+        )
+        self.mailpoolhub_provider_var = tk.StringVar(
+            value=str(config.get("mailpoolhub_provider", "") or "")
+        )
+        self._mailpoolhub_widgets = [
+            p_label(0, 0, "API Base:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.mailpoolhub_api_base_var, width=52),
+                0,
+                1,
+                columnspan=3,
+            ),
+            p_label(1, 0, "API Key:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.mailpoolhub_api_key_var, width=34, show="*"),
+                1,
+                1,
+            ),
+            p_label(1, 2, "内部渠道（可选）:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.mailpoolhub_provider_var, width=34),
+                1,
+                3,
+            ),
+            p_label(2, 0, "说明:"),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="留空由 MailPoolHub 自动调度；可填 mailgw 固定渠道",
+                    bg=UI_PANEL_BG,
+                ),
+                2,
+                1,
+                columnspan=3,
+                sticky=tk.W,
+            ),
+        ]
+
         # CloudMail
         self.cloudmail_url_var = tk.StringVar(value=str(config.get("cloudmail_url", "")))
         self.cloudmail_admin_email_var = tk.StringVar(value=str(config.get("cloudmail_admin_email", "")))
@@ -2603,11 +2763,71 @@ class GrokRegisterGUI:
             "cloudflare": self._cloudflare_widgets,
             "yyds": self._yyds_widgets,
             "mailnest": self._mailnest_widgets,
+            "mailpoolhub": self._mailpoolhub_widgets,
             "cloudmail": self._cloudmail_widgets,
             "moemail": self._moemail_widgets,
         }
 
-        add_label(3, 0, "并发数（可选）:")
+        self.proxy_source_frame = tk.LabelFrame(
+            config_frame,
+            text="代理来源配置",
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            padx=8,
+            pady=6,
+            relief=tk.GROOVE,
+            borderwidth=1,
+        )
+        self.proxy_source_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
+        self.proxy_source_frame.grid_columnconfigure(1, weight=1, minsize=360)
+        self.resin_template_var = tk.StringVar(value="")
+        self.resin_template_label = tk_label(
+            self.proxy_source_frame, text="Resin 模板:", bg=UI_PANEL_BG
+        )
+        self.resin_template_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=3)
+        self.resin_template_entry = tk_entry(
+            self.proxy_source_frame,
+            textvariable=self.resin_template_var,
+            width=56,
+            show="*",
+        )
+        self.resin_template_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 8), pady=3)
+        self.proxy_source_buttons = tk.Frame(self.proxy_source_frame, bg=UI_PANEL_BG)
+        self.proxy_source_buttons.grid(row=0, column=2, sticky=tk.E, pady=3)
+        tk_button(
+            self.proxy_source_buttons,
+            text="保存",
+            command=self.save_proxy_source_config,
+        ).pack(side=tk.LEFT, padx=2)
+        self.resin_test_button = tk_button(
+            self.proxy_source_buttons,
+            text="测试 Resin",
+            command=self.test_resin_proxy_config,
+        )
+        self.resin_test_button.pack(side=tk.LEFT, padx=2)
+        self.resin_clear_button = tk_button(
+            self.proxy_source_buttons,
+            text="清除模板",
+            command=self.clear_resin_proxy_config,
+        )
+        self.resin_clear_button.pack(side=tk.LEFT, padx=2)
+        resin_state = proxy_source_state.get("resin") or {}
+        self.proxy_source_status_var = tk.StringVar(
+            value=(
+                f"已配置：{resin_state.get('display_url') or '凭据已隐藏'}"
+                if resin_state.get("configured")
+                else "Resin 模板未配置"
+            )
+        )
+        self.proxy_source_status = tk_label(
+            self.proxy_source_frame,
+            textvariable=self.proxy_source_status_var,
+            bg=UI_PANEL_BG,
+            fg=UI_MUTED_FG,
+        )
+        self.proxy_source_status.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
+
+        add_label(4, 0, "并发数（可选）:")
         self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
         self.workers_spinbox = tk.Spinbox(
             config_frame,
@@ -2623,15 +2843,15 @@ class GrokRegisterGUI:
             disabledforeground=UI_MUTED_FG,
             relief=tk.SOLID,
         )
-        add_field(self.workers_spinbox, 3, 1, sticky=tk.W)
+        add_field(self.workers_spinbox, 4, 1, sticky=tk.W)
 
-        add_label(3, 2, "账号间隔（秒）:")
+        add_label(4, 2, "账号间隔（秒）:")
         self.account_interval_var = tk.StringVar(
             value=str(config.get("account_interval", "60-120") or "60-120")
         )
         add_field(
             tk_entry(config_frame, textvariable=self.account_interval_var, width=20),
-            3,
+            4,
             3,
         )
 
@@ -2646,7 +2866,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.cpa_frame.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.cpa_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
         self.cpa_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.cpa_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -2701,8 +2921,10 @@ class GrokRegisterGUI:
         c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_auth_dir_var, width=52), 4, 1, columnspan=3)
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
+        self.proxy_mode_var.trace_add("write", lambda *_: self._refresh_proxy_source_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
         self._refresh_provider_fields()
+        self._refresh_proxy_source_fields()
         self._refresh_cpa_fields()
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
@@ -2779,6 +3001,7 @@ class GrokRegisterGUI:
             "cloudflare": "Cloudflare 配置",
             "yyds": "YYDS 配置",
             "mailnest": "MailNest 配置",
+            "mailpoolhub": "MailPoolHub 配置",
             "cloudmail": "CloudMail 配置",
             "moemail": "MoeMail 配置",
         }
@@ -2789,6 +3012,115 @@ class GrokRegisterGUI:
         for widget in self._provider_widget_groups.get(provider, self._cloudflare_widgets):
             # grid_remove 后无参 grid() 会恢复原行列
             widget.grid()
+
+    def _proxy_mode_key(self):
+        return {
+            "直连": "direct",
+            "静态代理池": "pool",
+            "Resin UUID": "resin",
+        }.get(str(self.proxy_mode_var.get()), "pool")
+
+    def _refresh_proxy_source_fields(self):
+        resin = self._proxy_mode_key() == "resin"
+        for widget in (
+            self.resin_template_label,
+            self.resin_template_entry,
+            self.resin_test_button,
+            self.resin_clear_button,
+        ):
+            if resin:
+                widget.grid() if widget is not self.resin_test_button and widget is not self.resin_clear_button else None
+            else:
+                if widget in (self.resin_test_button, self.resin_clear_button):
+                    continue
+                widget.grid_remove()
+        if resin:
+            self.proxy_source_buttons.grid()
+            self.proxy_source_status.grid()
+        elif self._proxy_mode_key() == "pool":
+            self.proxy_source_buttons.grid()
+            self.resin_test_button.pack_forget()
+            self.resin_clear_button.pack_forget()
+            self.proxy_source_status.grid()
+            self.proxy_source_status_var.set("静态代理请在 Web 面板导入并检测")
+        else:
+            self.proxy_source_buttons.grid()
+            self.resin_test_button.pack_forget()
+            self.resin_clear_button.pack_forget()
+            self.proxy_source_status.grid()
+            self.proxy_source_status_var.set("直连模式不会使用其它代理来源")
+        if resin:
+            if not self.resin_test_button.winfo_manager():
+                self.resin_test_button.pack(side=tk.LEFT, padx=2)
+            if not self.resin_clear_button.winfo_manager():
+                self.resin_clear_button.pack(side=tk.LEFT, padx=2)
+            try:
+                self._update_proxy_source_state(_read_proxy_source_config())
+            except Exception:
+                pass
+
+    def _update_proxy_source_state(self, state):
+        resin = (state or {}).get("resin") or {}
+        if resin.get("configured"):
+            status = resin.get("status") or "unknown"
+            endpoint = resin.get("display_url") or "凭据已隐藏"
+            self.proxy_source_status_var.set(f"已配置：{endpoint} · {status}")
+        else:
+            self.proxy_source_status_var.set("Resin 模板未配置")
+
+    def save_proxy_source_config(self):
+        try:
+            state = _save_proxy_source_config(
+                self._proxy_mode_key(),
+                resin_template=self.resin_template_var.get().strip(),
+            )
+            self.resin_template_var.set("")
+            self._update_proxy_source_state(state)
+            self.log("[*] 代理来源配置已保存")
+            return True
+        except Exception as exc:
+            self.log(f"[!] 保存代理来源失败: {redact_sensitive_log_line(str(exc))}")
+            return False
+
+    def test_resin_proxy_config(self):
+        self.resin_test_button.config(state=tk.DISABLED)
+        template = self.resin_template_var.get().strip()
+
+        def job():
+            try:
+                result = _test_resin_proxy_template(template)
+                if result.get("ok"):
+                    message = (
+                        f"[*] Resin 可用：出口 {result.get('exit_ip') or '--'}，"
+                        f"xAI HTTP {result.get('xai_status') or '--'}"
+                    )
+                else:
+                    message = f"[!] Resin 测试失败: {result.get('error') or '未知错误'}"
+                self.log(message)
+                if not template:
+                    state = _read_proxy_source_config()
+                    self.root.after(0, lambda: self._update_proxy_source_state(state))
+            except Exception as exc:
+                self.log(f"[!] Resin 测试失败: {redact_sensitive_log_line(str(exc))}")
+            finally:
+                self.root.after(0, lambda: self.resin_test_button.config(state=tk.NORMAL))
+
+        threading.Thread(target=job, name="resin-template-test", daemon=True).start()
+
+    def clear_resin_proxy_config(self):
+        if not messagebox.askyesno("确认", "清除已保存的 Resin 模板？"):
+            return
+        if self._proxy_mode_key() == "resin":
+            self.proxy_mode_var.set("直连")
+        try:
+            state = _save_proxy_source_config(
+                self._proxy_mode_key(), clear_resin_template=True
+            )
+            self.resin_template_var.set("")
+            self._update_proxy_source_state(state)
+            self.log("[*] Resin 模板已清除")
+        except Exception as exc:
+            self.log(f"[!] 清除 Resin 模板失败: {redact_sensitive_log_line(str(exc))}")
 
     def _refresh_cpa_fields(self):
         """未开启 SSO→auth 时隐藏 CPA 目录/远程配置。"""
@@ -2864,6 +3196,9 @@ class GrokRegisterGUI:
             config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
             config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
             config["mailnest_api_key"] = self.mailnest_api_key_var.get().strip()
+            config["mailpoolhub_api_base"] = self.mailpoolhub_api_base_var.get().strip()
+            config["mailpoolhub_api_key"] = self.mailpoolhub_api_key_var.get().strip()
+            config["mailpoolhub_provider"] = self.mailpoolhub_provider_var.get().strip()
             config["cloudmail_url"] = self.cloudmail_url_var.get().strip()
             config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
             config["cloudmail_password"] = self.cloudmail_password_var.get()
@@ -2895,7 +3230,9 @@ class GrokRegisterGUI:
 
         def _job():
             try:
-                results = _conn.run_connectivity_checks(config, http_get, http_post)
+                results = _conn.run_connectivity_checks(
+                    connectivity_config_for_current_proxy(), http_get, http_post
+                )
                 text = _conn.format_check_results(results)
                 all_ok = all(ok for _, ok, _ in results)
                 self.ui_queue.put((self._on_check_done, (text, all_ok)))
@@ -2956,6 +3293,8 @@ class GrokRegisterGUI:
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
             return
+        if not self.save_proxy_source_config():
+            return
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
@@ -2976,6 +3315,9 @@ class GrokRegisterGUI:
         config["mailnest_project_code"] = (
             self.mailnest_project_code_var.get().strip() or MAILNEST_DEFAULT_PROJECT_CODE
         )
+        config["mailpoolhub_api_base"] = self.mailpoolhub_api_base_var.get().strip()
+        config["mailpoolhub_api_key"] = self.mailpoolhub_api_key_var.get().strip()
+        config["mailpoolhub_provider"] = self.mailpoolhub_provider_var.get().strip()
         config["yyds_default_domain"] = self.yyds_default_domain_var.get().strip()
         config["cloudmail_url"] = self.cloudmail_url_var.get().strip()
         config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
@@ -3018,6 +3360,15 @@ class GrokRegisterGUI:
         if config["email_provider"] == "mailnest" and not config["mailnest_api_key"]:
             self.log("[!] MailNest 模式需要先填写 MailNest API Key")
             return
+        if config["email_provider"] == "mailpoolhub":
+            missing = []
+            if not get_mailpoolhub_api_base():
+                missing.append("MailPoolHub API Base")
+            if not get_mailpoolhub_api_key():
+                missing.append("MailPoolHub API Key")
+            if missing:
+                self.log(f"[!] MailPoolHub 模式缺少配置: {', '.join(missing)}")
+                return
         if config["email_provider"] == "moemail":
             missing = []
             if not get_moemail_api_base():
@@ -3078,7 +3429,9 @@ class GrokRegisterGUI:
         self._accounts_lock = threading.Lock()
         # 启动前快速连通性检查（失败仍可继续，只警告）
         try:
-            checks = _conn.run_connectivity_checks(config, http_get, http_post)
+            checks = _conn.run_connectivity_checks(
+                connectivity_config_for_current_proxy(), http_get, http_post
+            )
             for name, ok, detail in checks:
                 self.log(
                     f"[检查] [{'OK' if ok else 'FAIL'}] {name}: "
@@ -3422,9 +3775,7 @@ def run_registration_cli(count):
     except Exception:
         pass
     try:
-        startup_config = dict(config)
-        if pool:
-            startup_config["proxy"] = pool[0]
+        startup_config = connectivity_config_for_current_proxy()
         startup_checks = _conn.run_connectivity_checks(startup_config, http_get, http_post)
         for name, ok, detail in startup_checks:
             cli_log(
@@ -3529,6 +3880,7 @@ def run_registration_cli(count):
                 retry = 0
                 worker_stop = False
                 while i < n and not controller.should_stop() and not worker_stop:
+                    email = ""
                     try:
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),

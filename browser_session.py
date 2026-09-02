@@ -16,74 +16,13 @@ import uuid
 from typing import Callable, Optional, Tuple
 from urllib.parse import urlparse
 
-import asyncio
-from greenlet import greenlet
-from typing import cast as _tcast
-
-from camoufox.sync_api import Camoufox as _Camoufox, NewBrowser
-from playwright._impl._connection import Connection as _PwConnection
-from playwright._impl._greenlets import MainGreenlet as _PwMainGreenlet
-from playwright._impl._object_factory import create_remote_object as _pw_create_remote
-from playwright._impl._playwright import Playwright as _PwImpl
-from playwright._impl._transport import PipeTransport as _PwPipeTransport
-from playwright.sync_api._generated import Playwright as _SyncPlaywright
+from camoufox import DefaultAddons
+from camoufox.sync_api import Camoufox as _Camoufox
 
 from camoufox_adapter import CamoufoxBrowser, CamoufoxPage
 from secure_files import ensure_private_dir
 from webui.blacklist_store import read_blacklist
 from webui.security_utils import redact_log_line, redact_proxy
-
-
-class SafeCamoufox(_Camoufox):
-    """Camoufox 子类，绕过 PlaywrightContextManager 的事件循环检查。
-
-    PlaywrightContextManager.__enter__() 调用 asyncio.get_running_loop()，
-    如果当前线程有运行中的 asyncio 事件循环（如 tkinter 或其他库遗留），
-    就会报错 "Sync API inside the asyncio loop"。
-
-    此子类直接创建全新的、非运行状态的事件循环，完全绕过该检查。
-    通过重写 __enter__()，跳过 get_running_loop() / is_running() 判断，
-    直接用 asyncio.new_event_loop() 创建干净的事件循环。
-    """
-
-    def __enter__(self):
-        # 强制创建全新的事件循环，跳过 get_running_loop() / is_running() 检查
-        self._loop = asyncio.new_event_loop()
-        self._own_loop = True
-
-        # 复制 PlaywrightContextManager.__enter__() 的 greenlet 调度逻辑
-        def _greenlet_main():
-            self._loop.run_until_complete(self._connection.run_as_sync())
-
-        dispatcher_fiber = _PwMainGreenlet(_greenlet_main)
-
-        self._connection = _PwConnection(
-            dispatcher_fiber,
-            _pw_create_remote,
-            _PwPipeTransport(self._loop),
-            self._loop,
-        )
-
-        g_self = greenlet.getcurrent()
-
-        def _callback_wrapper(channel_owner):
-            playwright_impl = _tcast(_PwImpl, channel_owner)
-            self._playwright = _SyncPlaywright(playwright_impl)
-            g_self.switch()
-
-        self._connection.call_on_object_with_known_name("Playwright", _callback_wrapper)
-        dispatcher_fiber.switch()
-
-        playwright = self._playwright
-        playwright.stop = self.__exit__
-
-        # Camoufox 特有：启动浏览器
-        try:
-            self.browser = NewBrowser(self._playwright, **self.launch_options)
-        except BaseException as e:
-            super().__exit__(type(e), e, e.__traceback__)
-            raise
-        return self.browser
 
 
 # 仅允许删除该目录树下的临时 profile，防止误删其它路径
@@ -573,6 +512,7 @@ def create_browser_options(unique_profile=True) -> dict:
         "locale": "en-US",      # 与美西出口一致，避免 UI 语言漂移
         "block_webrtc": True,   # 防止 WebRTC 泄漏真实 IP（即使使用代理）
         "i_know_what_im_doing": True,  # 抑制 Firefox 版本伪装警告（Camoufox 引擎层伪装是预期行为）
+        "exclude_addons": [DefaultAddons.UBO],  # 注册流程不依赖 UBO，避免启动时联网下载扩展
     }
 
     # 旧格式安装兼容：传 executable_path 绕过 installed_verstr() 检查
@@ -656,9 +596,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
             if log_callback and isinstance(opts.get("geoip"), str):
                 log_callback(f"[Debug] geoip 使用预解析出口 IP: {opts['geoip']}")
 
-            # SafeCamoufox.__enter__() 直接创建全新事件循环，
-            # 完全绕过 PlaywrightContextManager 的 get_running_loop() 检查
-            camoufox = SafeCamoufox(**opts)
+            camoufox = _Camoufox(**opts)
             browser_context = camoufox.__enter__()
 
             # 获取或创建页面

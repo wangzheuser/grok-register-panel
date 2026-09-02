@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,9 +33,11 @@ STATE_PATH = Path(
 )
 LOCK_PATH = STATE_PATH.with_suffix(STATE_PATH.suffix + ".lock")
 LEGACY_PATH = Path(os.environ.get("PROXY_POOL_LEGACY_FILE", str(ROOT / "proxies.txt")))
+CONFIG_PATH = Path(os.environ.get("PROXY_POOL_CONFIG_FILE", str(ROOT / "config.json")))
 
 ALLOWED_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ALLOWED_STATUSES = {"unknown", "healthy", "unhealthy", "cooldown"}
+ALLOWED_MODES = {"direct", "pool", "resin"}
 MAX_IMPORT_ITEMS = 500
 MAX_TEST_ITEMS = 200
 DEFAULT_TEST_TIMEOUT = 8.0
@@ -185,12 +188,124 @@ def normalize_proxy(value: object) -> str:
         raise ProxyValidationError("无法解析代理地址") from exc
 
 
+def normalize_resin_template(value: object) -> str:
+    """Validate and canonicalize a Resin URL while preserving one {uuid}."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ProxyValidationError("Resin 代理模板为空")
+    if any(char.isspace() for char in raw):
+        raise ProxyValidationError("Resin 代理模板不能包含空白字符")
+    if raw.count("{uuid}") != 1:
+        raise ProxyValidationError("Resin 代理模板必须且只能包含一个 {uuid}")
+    if "://" not in raw:
+        raise ProxyValidationError("Resin 代理模板必须使用完整 URL")
+
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        if scheme not in ALLOWED_SCHEMES:
+            raise ProxyValidationError("仅支持 http、https、socks5、socks5h")
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise ProxyValidationError("Resin 代理模板不能包含路径、查询参数或片段")
+        if not parsed.hostname:
+            raise ProxyValidationError("缺少代理主机")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ProxyValidationError("代理端口无效") from exc
+        if port is None or not 1 <= port <= 65535:
+            raise ProxyValidationError("代理端口必须在 1-65535 之间")
+        if parsed.username is None or parsed.password is None:
+            raise ProxyValidationError("Resin 代理模板必须包含完整账号和密码")
+
+        username = unquote(parsed.username)
+        password = unquote(parsed.password)
+        if not username or not password:
+            raise ProxyValidationError("Resin 代理账号或密码为空")
+        if username.count("{uuid}") != 1:
+            raise ProxyValidationError("{uuid} 只能位于代理用户名中")
+        if "{" in username.replace("{uuid}", "") or "}" in username.replace("{uuid}", ""):
+            raise ProxyValidationError("代理用户名包含非法占位符")
+
+        host = parsed.hostname.lower().rstrip(".")
+        if ":" in host:
+            host = f"[{host}]"
+        encoded_username = quote(username, safe="{}")
+        encoded_password = quote(password, safe="")
+        return f"{scheme}://{encoded_username}:{encoded_password}@{host}:{port}"
+    except ProxyValidationError:
+        raise
+    except Exception as exc:
+        raise ProxyValidationError("无法解析 Resin 代理模板") from exc
+
+
+def materialize_resin_template(value: object) -> str:
+    template = normalize_resin_template(value)
+    return template.replace("{uuid}", str(uuid.uuid4()))
+
+
 def _proxy_id(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
 
 
+def _default_resin_state() -> dict:
+    return {
+        "template": "",
+        "status": "unknown",
+        "exit_ip": "",
+        "asn": None,
+        "asn_org": "",
+        "latency_ms": None,
+        "xai_status": None,
+        "last_checked_at": "",
+        "last_error": "",
+        "success_count": 0,
+        "failure_count": 0,
+        "risk_count": 0,
+    }
+
+
+def _normalize_resin_state(raw: object) -> dict:
+    result = _default_resin_state()
+    if not isinstance(raw, dict):
+        return result
+    try:
+        result["template"] = normalize_resin_template(raw.get("template"))
+    except ProxyValidationError:
+        result["template"] = ""
+    status = str(raw.get("status") or "unknown").strip().lower()
+    result["status"] = status if status in {"unknown", "healthy", "unhealthy"} else "unknown"
+    result["exit_ip"] = _clean_text(raw.get("exit_ip"), 64)
+    try:
+        asn = int(raw.get("asn")) if raw.get("asn") not in (None, "") else None
+    except (TypeError, ValueError):
+        asn = None
+    result["asn"] = asn if asn is None or asn > 0 else None
+    result["asn_org"] = _clean_text(raw.get("asn_org"), 120)
+    result["latency_ms"] = (
+        _safe_int(raw.get("latency_ms")) if raw.get("latency_ms") not in (None, "") else None
+    )
+    try:
+        xai_status = int(raw.get("xai_status")) if raw.get("xai_status") not in (None, "") else None
+    except (TypeError, ValueError):
+        xai_status = None
+    result["xai_status"] = xai_status if xai_status and 100 <= xai_status <= 599 else None
+    result["last_checked_at"] = _clean_text(raw.get("last_checked_at"), 40)
+    result["last_error"] = _clean_text(raw.get("last_error"), 180)
+    result["success_count"] = _safe_int(raw.get("success_count"))
+    result["failure_count"] = _safe_int(raw.get("failure_count"))
+    result["risk_count"] = _safe_int(raw.get("risk_count"))
+    return result
+
+
 def _default_state() -> dict:
-    return {"version": 1, "items": [], "updated_at": _utc_now()}
+    return {
+        "version": 2,
+        "mode": "",
+        "items": [],
+        "resin": _default_resin_state(),
+        "updated_at": _utc_now(),
+    }
 
 
 def _normalize_item(raw: object) -> dict | None:
@@ -246,9 +361,14 @@ def _normalize_state(raw: object) -> dict:
         item = _normalize_item(candidate)
         if item:
             items_by_id[item["id"]] = item
+    mode = str(raw.get("mode") or "").strip().lower()
+    if mode not in ALLOWED_MODES:
+        mode = ""
     return {
-        "version": 1,
+        "version": 2,
+        "mode": mode,
         "items": list(items_by_id.values()),
+        "resin": _normalize_resin_state(raw.get("resin")),
         "updated_at": _clean_text(raw.get("updated_at"), 40) or _utc_now(),
     }
 
@@ -303,6 +423,40 @@ def _legacy_info() -> dict:
     }
 
 
+def _legacy_config_proxy() -> str:
+    try:
+        import json
+
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8") or "{}")
+        return str(raw.get("proxy") or "").strip() if isinstance(raw, dict) else ""
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+def _effective_resin_template(state: dict) -> str:
+    stored = str((state.get("resin") or {}).get("template") or "").strip()
+    if stored:
+        return stored
+    legacy = _legacy_config_proxy()
+    if "{uuid}" not in legacy:
+        return ""
+    try:
+        return normalize_resin_template(legacy)
+    except ProxyValidationError:
+        return ""
+
+
+def _effective_mode(state: dict) -> tuple[str, bool]:
+    explicit = str(state.get("mode") or "").strip().lower()
+    if explicit in ALLOWED_MODES:
+        return explicit, True
+    if _effective_resin_template(state):
+        return "resin", False
+    if state.get("items") or _legacy_info()["available"] or _legacy_config_proxy():
+        return "pool", False
+    return "direct", False
+
+
 def _public_item(item: dict, testing_ids: set[str], now: datetime) -> dict:
     cooldown_until = _parse_utc(item.get("cooldown_until"))
     remaining = 0
@@ -354,6 +508,9 @@ def read_proxy_pool() -> dict:
     testing_ids = set(job.get("testing_ids") or [])
     now = datetime.now(timezone.utc)
     items = [_public_item(item, testing_ids, now) for item in state["items"]]
+    mode, mode_explicit = _effective_mode(state)
+    resin_state = state.get("resin") or _default_resin_state()
+    resin_template = _effective_resin_template(state)
     summary = {
         "total": len(items),
         "enabled": sum(1 for item in items if item["enabled"]),
@@ -379,6 +536,23 @@ def read_proxy_pool() -> dict:
         "items": items,
         "test_job": job,
         "legacy": _legacy_info(),
+        "mode": mode,
+        "mode_explicit": mode_explicit,
+        "resin": {
+            "configured": bool(resin_template),
+            "display_url": redact_proxy(resin_template) if resin_template else "",
+            "status": resin_state.get("status") or "unknown",
+            "exit_ip": resin_state.get("exit_ip") or "",
+            "asn": resin_state.get("asn"),
+            "asn_org": resin_state.get("asn_org") or "",
+            "latency_ms": resin_state.get("latency_ms"),
+            "xai_status": resin_state.get("xai_status"),
+            "last_checked_at": resin_state.get("last_checked_at") or "",
+            "last_error": resin_state.get("last_error") or "",
+            "success_count": resin_state.get("success_count", 0),
+            "failure_count": resin_state.get("failure_count", 0),
+            "risk_count": resin_state.get("risk_count", 0),
+        },
         "updated_at": state.get("updated_at") or "",
         "mtime": mtime,
     }
@@ -503,19 +677,72 @@ def delete_proxy(proxy_id: str) -> dict:
     return result
 
 
-def worker_proxy_snapshot() -> dict:
-    """Return secret worker URLs plus whether a managed pool is configured."""
+def save_proxy_config(
+    mode: object,
+    *,
+    resin_template: object = "",
+    clear_resin_template: object = False,
+) -> dict:
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in ALLOWED_MODES:
+        raise ProxyValidationError("代理来源模式无效")
+    if not isinstance(clear_resin_template, bool):
+        raise ProxyValidationError("clear_resin_template 必须是布尔值")
+    submitted = str(resin_template or "").strip()
+
+    with exclusive_file_lock(LOCK_PATH):
+        state, errors = _read_unlocked()
+        if errors:
+            raise RuntimeError(f"代理配置无法读取: {errors[0]}")
+        existing = _effective_resin_template(state)
+        if clear_resin_template:
+            existing = ""
+            state["resin"] = _default_resin_state()
+        if submitted:
+            existing = normalize_resin_template(submitted)
+            state["resin"] = _default_resin_state()
+            state["resin"]["template"] = existing
+        elif existing and not (state.get("resin") or {}).get("template"):
+            state["resin"] = _default_resin_state()
+            state["resin"]["template"] = existing
+        if normalized_mode == "resin" and not existing:
+            raise ProxyValidationError("Resin 模式需要先配置代理模板")
+        state["mode"] = normalized_mode
+        _write_unlocked(state)
+    return read_proxy_pool()
+
+
+def proxy_runtime_snapshot() -> dict:
+    """Return the effective proxy source, including secret runtime values."""
     with exclusive_file_lock(LOCK_PATH):
         state, _ = _read_unlocked()
         changed = _release_expired_cooldowns(state)
-        urls = [
-            item["url"]
-            for item in state["items"]
-            if item["enabled"] and item["status"] == "healthy"
-        ]
         if changed:
             _write_unlocked(state)
-    return {"configured": bool(state["items"]), "urls": urls}
+    mode, explicit = _effective_mode(state)
+    urls = [
+        item["url"]
+        for item in state["items"]
+        if item["enabled"] and item["status"] == "healthy"
+    ]
+    return {
+        "mode": mode,
+        "mode_explicit": explicit,
+        "pool_configured": bool(state["items"]),
+        "urls": urls,
+        "resin_template": _effective_resin_template(state),
+    }
+
+
+def worker_proxy_snapshot() -> dict:
+    """Return secret worker URLs plus whether a managed pool is configured."""
+    snapshot = proxy_runtime_snapshot()
+    mode = snapshot["mode"]
+    strict_pool = mode == "pool" and snapshot["mode_explicit"]
+    return {
+        **snapshot,
+        "configured": mode in {"direct", "resin"} or strict_pool or snapshot["pool_configured"],
+    }
 
 
 def list_worker_proxies() -> list[str]:
@@ -581,6 +808,29 @@ def record_proxy_result(url: object, outcome: str, error: object = "") -> bool:
         if changed:
             _write_unlocked(state)
     return changed
+
+
+def record_resin_result(outcome: str, error: object = "") -> bool:
+    outcome = str(outcome or "").strip().lower()
+    if outcome not in {"success", "network", "risk"}:
+        raise ValueError(f"unknown Resin outcome: {outcome}")
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        if not _effective_resin_template(state):
+            return False
+        resin = state["resin"]
+        if outcome == "success":
+            resin["success_count"] += 1
+            resin["status"] = "healthy"
+            resin["last_error"] = ""
+        else:
+            resin["failure_count"] += 1
+            resin["status"] = "unhealthy"
+            resin["last_error"] = _clean_text(error) or "Resin 代理运行失败"
+            if outcome == "risk":
+                resin["risk_count"] += 1
+        _write_unlocked(state)
+    return True
 
 
 def _parse_probe_payload(payload: object) -> tuple[str, int | None, str]:
@@ -652,6 +902,83 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
         except Exception as exc:
             last_error = exc
     raise RuntimeError(_probe_error_message(last_error))
+
+
+def _apply_resin_probe_result(result: dict) -> None:
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        if not _effective_resin_template(state):
+            return
+        resin = state["resin"]
+        resin["last_checked_at"] = result.get("checked_at") or _utc_now()
+        resin["status"] = "healthy" if result.get("ok") else "unhealthy"
+        resin["exit_ip"] = _clean_text(result.get("exit_ip"), 64)
+        resin["asn"] = result.get("asn")
+        resin["asn_org"] = _clean_text(result.get("asn_org"), 120)
+        resin["latency_ms"] = result.get("latency_ms")
+        resin["xai_status"] = result.get("xai_status")
+        resin["last_error"] = _clean_text(result.get("error"))
+        _write_unlocked(state)
+
+
+def test_resin_proxy_template(
+    template: object = "",
+    *,
+    timeout: float = DEFAULT_TEST_TIMEOUT,
+) -> dict:
+    submitted = str(template or "").strip()
+    persist = not submitted
+    if submitted:
+        normalized = normalize_resin_template(submitted)
+    else:
+        with exclusive_file_lock(LOCK_PATH):
+            state, errors = _read_unlocked()
+        if errors:
+            raise RuntimeError(f"代理配置无法读取: {errors[0]}")
+        normalized = _effective_resin_template(state)
+        if not normalized:
+            raise ProxyValidationError("尚未配置 Resin 代理模板")
+
+    concrete = materialize_resin_template(normalized)
+    checked_at = _utc_now()
+    try:
+        result = probe_proxy(concrete, timeout=timeout)
+        from curl_cffi import requests as curl_requests
+
+        response = curl_requests.get(
+            "https://accounts.x.ai/sign-up?redirect=grok-com",
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/138.0.0.0 Safari/537.36"
+                ),
+            },
+            proxies={"http": concrete, "https": concrete},
+            timeout=max(5.0, min(float(timeout) * 2, 20.0)),
+            allow_redirects=True,
+            impersonate="chrome",
+        )
+        status = int(response.status_code or 0)
+        body = str(response.text or "").lower()
+        challenge = (
+            "just a moment" in body[:2000]
+            or "checking your browser" in body[:2000]
+            or "__cf_chl" in body
+        )
+        if status <= 0 or status >= 400 or challenge:
+            raise RuntimeError(f"xAI 注册页不可用 HTTP {status or 'unknown'}")
+        result.update({"ok": True, "xai_status": status, "checked_at": checked_at})
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "error": _probe_error_message(exc),
+            "checked_at": checked_at,
+        }
+    if persist:
+        _apply_resin_probe_result(result)
+    return result
 
 
 def _apply_probe_result(proxy_id: str, result: dict) -> None:

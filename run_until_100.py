@@ -101,7 +101,7 @@ def start_batch(count: int):
     fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.fchmod(fd, 0o600)
-    except OSError:
+    except (AttributeError, OSError):
         pass
     fout = os.fdopen(fd, "w", encoding="utf-8")
     cmd = []

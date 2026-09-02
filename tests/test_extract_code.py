@@ -30,6 +30,17 @@ def test_mixed_real_codes():
     assert extract_verification_code("only max-100 in mail chrome", "") is None
 
 
+def test_numeric_xai_confirmation_code_requires_trusted_context():
+    assert (
+        extract_verification_code(
+            "Please use the code below to validate your email address.\n605-680",
+            "SpaceXAI confirmation code: 605-680",
+        )
+        == "605-680"
+    )
+    assert extract_verification_code("width: 605-680px", "newsletter") is None
+
+
 if __name__ == "__main__":
     test_reject_per100()
     test_subject_wins()

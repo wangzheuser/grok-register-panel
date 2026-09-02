@@ -194,7 +194,7 @@ def start_recovery(scope: str = "pending") -> dict:
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         os.fchmod(fd, 0o600)
-    except OSError:
+    except (AttributeError, OSError):
         pass
     output = os.fdopen(fd, "w", encoding="utf-8")
     command = [

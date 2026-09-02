@@ -26,6 +26,7 @@ PROVIDER_LABELS = {
     "mailnest": "MailNest",
     "cloudmail": "CloudMail",
     "moemail": "MoeMail",
+    "mailpoolhub": "MailPoolHub",
 }
 SUPPORTED_PROVIDERS = tuple(PROVIDER_LABELS)
 
@@ -115,6 +116,22 @@ FIELD_DEFINITIONS = {
         "type": "text",
         "default": "x-ai001",
     },
+    "mailpoolhub_api_base": {
+        "label": "API Base",
+        "type": "url",
+        "default": "http://127.0.0.1:8080/api/v1",
+        "placeholder": "http://127.0.0.1:8080/api/v1",
+    },
+    "mailpoolhub_api_key": {
+        "label": "API Key",
+        "type": "password",
+        "secret": True,
+    },
+    "mailpoolhub_provider": {
+        "label": "内部渠道（可选）",
+        "type": "text",
+        "placeholder": "留空自动调度，例如 mailgw",
+    },
     "cloudmail_url": {
         "label": "站点 URL",
         "type": "url",
@@ -172,6 +189,11 @@ PROVIDER_FIELDS = {
     "duckmail": ("duckmail_api_base", "duckmail_api_key"),
     "yyds": ("yyds_api_key", "yyds_jwt", "yyds_default_domain"),
     "mailnest": ("mailnest_api_key", "mailnest_project_code"),
+    "mailpoolhub": (
+        "mailpoolhub_api_base",
+        "mailpoolhub_api_key",
+        "mailpoolhub_provider",
+    ),
     "cloudmail": (
         "cloudmail_url",
         "cloudmail_admin_email",
@@ -307,10 +329,13 @@ def _normalize_value(name: str, value: object):
         if candidate not in allowed:
             raise EmailProviderConfigError(f"{definition['label']}无效")
         return candidate
-    if name == "mailnest_project_code":
+    if name in {"mailnest_project_code", "mailpoolhub_provider"}:
         text = _string(value) or str(definition.get("default") or "")
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", text):
-            raise EmailProviderConfigError("项目代码格式无效")
+        if name == "mailpoolhub_provider":
+            text = text.lower()
+        if text and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", text):
+            label = "项目代码" if name == "mailnest_project_code" else "内部渠道"
+            raise EmailProviderConfigError(f"{label}格式无效")
         return text
     return _string(value, strip=name != "cloudmail_password")
 
@@ -333,6 +358,8 @@ def _is_configured(provider: str, values: dict) -> bool:
         return bool(values.get("yyds_api_key") or values.get("yyds_jwt"))
     if provider == "mailnest":
         return bool(values.get("mailnest_api_key"))
+    if provider == "mailpoolhub":
+        return bool(values.get("mailpoolhub_api_base") and values.get("mailpoolhub_api_key"))
     if provider == "cloudmail":
         return all(
             values.get(key)
@@ -456,19 +483,26 @@ def test_email_provider_config(
         raise RuntimeError(f"config.json 无法读取: {error}")
     candidate = _candidate_config(raw, provider, settings, clear_secrets)
     normalized_provider = _provider(provider)
+    owned_session = None
     if http_get is None or http_post is None:
         import requests
 
-        http_get = http_get or requests.get
-        http_post = http_post or requests.post
+        owned_session = requests.Session()
+        owned_session.trust_env = False
+        http_get = http_get or owned_session.get
+        http_post = http_post or owned_session.post
     import connectivity
 
-    _, ok, detail = connectivity.check_email_api(
-        normalized_provider,
-        candidate,
-        http_get,
-        http_post,
-    )
+    try:
+        _, ok, detail = connectivity.check_email_api(
+            normalized_provider,
+            candidate,
+            http_get,
+            http_post,
+        )
+    finally:
+        if owned_session is not None:
+            owned_session.close()
     return {
         "ok": bool(ok),
         "provider": normalized_provider,

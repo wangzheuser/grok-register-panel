@@ -22,6 +22,16 @@ _THREAD_LOCKS: dict[str, threading.RLock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 
 
+def _set_private_fd_mode(fd: int) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        return
+    try:
+        fchmod(fd, PRIVATE_FILE_MODE)
+    except OSError:
+        pass
+
+
 def ensure_private_dir(path: str | os.PathLike[str]) -> Path:
     target = Path(path)
     target.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
@@ -56,10 +66,7 @@ def append_private_text(
         PRIVATE_FILE_MODE,
     )
     try:
-        try:
-            os.fchmod(fd, PRIVATE_FILE_MODE)
-        except OSError:
-            pass
+        _set_private_fd_mode(fd)
         with os.fdopen(fd, "a", encoding=encoding, newline="\n") as handle:
             fd = -1
             handle.write(text)
@@ -84,10 +91,7 @@ def create_private_text(
         PRIVATE_FILE_MODE,
     )
     try:
-        try:
-            os.fchmod(fd, PRIVATE_FILE_MODE)
-        except OSError:
-            pass
+        _set_private_fd_mode(fd)
         with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
             fd = -1
             handle.write(text)
@@ -113,10 +117,7 @@ def atomic_write_text(
     )
     temp_path = Path(temp_name)
     try:
-        try:
-            os.fchmod(fd, PRIVATE_FILE_MODE)
-        except OSError:
-            pass
+        _set_private_fd_mode(fd)
         with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
             fd = -1
             handle.write(text)
@@ -163,10 +164,7 @@ def exclusive_file_lock(path: str | os.PathLike[str]) -> Iterator[None]:
             PRIVATE_FILE_MODE,
         )
         try:
-            try:
-                os.fchmod(fd, PRIVATE_FILE_MODE)
-            except OSError:
-                pass
+            _set_private_fd_mode(fd)
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_EX)
             yield

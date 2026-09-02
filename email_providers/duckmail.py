@@ -96,10 +96,10 @@ def pick_domain(domains: List[dict]) -> str:
         and (d.get("isActive") is not False)
     ]
     if private:
-        return private[0]["domain"]
+        return secrets.choice(private)["domain"]
     public = [d for d in domains if domain_is_usable(d)]
     if public:
-        return public[0]["domain"]
+        return secrets.choice(public)["domain"]
     for d in domains:
         if d.get("domain"):
             return d["domain"]

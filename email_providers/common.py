@@ -141,6 +141,19 @@ def extract_verification_code(text: str, subject: str = "") -> Optional[str]:
     subject = subject or ""
     text = text or ""
 
+    # 新版邮件主题使用纯数字 XXX-YYY；仅在明确的 xAI 确认码上下文中接受，
+    # 避免把 HTML/CSS 中的 100-200 一类尺寸误判为验证码。
+    trusted_hay = f"{subject}\n{text}"
+    m = re.search(
+        r"\b(?:spacexai|xai)\b[^\n]{0,64}?"
+        r"(?:verification|security|confirm(?:ation)?)\s+code[:\s]+"
+        r"(\d{3}-\d{3})\b",
+        trusted_hay,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
     m = re.search(r"^([A-Za-z0-9]{3}-[A-Za-z0-9]{3})\s+xAI\b", subject, re.IGNORECASE)
     if m and _is_plausible_xai_code(m.group(1)):
         return _normalize_code(m.group(1))

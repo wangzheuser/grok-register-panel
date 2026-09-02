@@ -120,18 +120,27 @@ def test_proxy_pool_panel_structure():
     assert 'id="proxy-input"' in html
     assert 'id="proxy-summary"' in html
     assert 'id="proxy-body"' in html
+    assert 'id="proxy-mode-select"' in html
+    assert 'id="proxy-resin-panel"' in html
+    assert 'id="resin-template-input" type="password"' in html
     assert 'function refreshProxies(' in mon
     assert 'function renderProxyPool(' in mon
     assert 'function importProxyInput(' in mon
     assert 'function testProxies(' in mon
     assert 'function setProxyEnabled(' in mon
     assert 'function deleteProxyItem(' in mon
+    assert 'function saveProxyMode(' in mon
+    assert 'function testResinTemplate(' in mon
     assert '/api/proxies/import' in mon
     assert '/api/proxies/test' in mon
+    assert '/api/proxies/config' in mon
+    assert '/api/proxies/resin/test' in mon
     assert 'def do_PATCH(self):' in mon
     assert 'def do_DELETE(self):' in mon
     assert 'worker_proxy_snapshot as _managed_worker_proxy_snapshot' in worker
     assert 'pool = load_proxy_pool()' in worker
+    assert 'record_resin_result as _record_resin_proxy_result' in worker
+    assert 'connectivity_config_for_current_proxy()' in worker
     assert '面板代理池没有健康且启用的代理' in worker
     assert 'redact_proxy(px)' in worker
 
