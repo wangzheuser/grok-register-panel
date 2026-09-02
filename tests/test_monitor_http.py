@@ -217,8 +217,7 @@ def test_proxy_api_auth_mutations_and_redaction():
             resin_state = json.loads(body)
             assert resin_state["mode"] == "resin"
             assert resin_state["resin"]["configured"] is True
-            assert resin_secret not in body.decode("utf-8")
-            assert "{uuid}" not in body.decode("utf-8")
+            assert resin_state["resin"]["template"] == resin_template
 
             status, _, body = request(
                 base + "/api/proxies/config",
@@ -227,7 +226,9 @@ def test_proxy_api_auth_mutations_and_redaction():
                 body=b'{"mode":"resin","resin_template":""}',
             )
             assert status == 200
-            assert json.loads(body)["resin"]["configured"] is True
+            resin_state = json.loads(body)["resin"]
+            assert resin_state["configured"] is True
+            assert resin_state["template"] == resin_template
 
             monitor.test_resin_proxy_template = lambda value="": {
                 "ok": True,

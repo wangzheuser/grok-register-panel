@@ -72,6 +72,7 @@ from webui.email_domain_store import (
     select_domain as _select_managed_email_domain,
 )
 from webui.security_utils import redact_log_line as redact_sensitive_log_line
+from webui.grok2api_sync import enqueue_sync as enqueue_grok2api_sync
 from browser_session import (
 
     browser,
@@ -226,6 +227,10 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     # Grok2API / ~/.grok 风格 auth 目录（默认项目根目录下 grok2api_auth/）
     "grok2api_auth_dir": "grok2api_auth",
+    # Grok2API 云端 SSO 同步（独立于 CPA/OAuth auth 输出）
+    "grok2api_sync_enabled": False,
+    "grok2api_sync_url": "",
+    "grok2api_sync_app_key": "",
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     "mailpoolhub_api_base": "http://127.0.0.1:8080/api/v1",
@@ -3622,6 +3627,9 @@ class GrokRegisterGUI:
                         wlog(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                         _append_sso_pending(email, sso, log_callback=wlog)
                         raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                    enqueue_grok2api_sync(
+                        config, sso, email=email, log_callback=wlog
+                    )
                     lock = getattr(self, "_stats_lock", None)
                     if lock:
                         with lock:
@@ -3930,6 +3938,12 @@ def run_registration_cli(count):
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                        enqueue_grok2api_sync(
+                            config,
+                            sso,
+                            email=email,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         cpa_ok = add_sso_to_cpa(
                             sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
                         )
@@ -4292,6 +4306,9 @@ def run_registration_cli(count):
                     cli_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                enqueue_grok2api_sync(
+                    config, sso, email=email, log_callback=cli_log
+                )
                 cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0

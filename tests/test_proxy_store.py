@@ -212,7 +212,7 @@ def test_resin_mode_save_mask_preserve_clear_and_strict_pool():
         assert saved["mode"] == "resin"
         assert saved["mode_explicit"] is True
         assert saved["resin"]["configured"] is True
-        assert "secret-pass" not in json.dumps(saved)
+        assert saved["resin"]["template"] == template
         assert "{uuid}" not in saved["resin"]["display_url"]
         raw = json.loads(proxy_store.STATE_PATH.read_text(encoding="utf-8"))
         assert raw["resin"]["template"] == template

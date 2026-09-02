@@ -7,7 +7,7 @@
 - [ ] The batch supervisor test restarts a simulated `_getChildFrames` driver crash and resumes only remaining slots.
 - [ ] `config.json`, all `proxies*.txt` / `stickies*.txt`, `accounts/`, auth directories, and `log/` are owner-only.
 - [ ] `log/proxy_pool.json` is `0600`; proxy API and rendered HTML never expose stored userinfo.
-- [ ] Direct, static-pool, and Resin UUID source modes are mutually exclusive; Resin templates preserve one literal `{uuid}` and never appear unredacted in API, HTML, or logs.
+- [ ] Direct, static-pool, and Resin UUID source modes are mutually exclusive; Resin templates preserve one literal `{uuid}`, and the authenticated proxy API returns the saved template for plaintext form echo while logs remain redacted.
 - [ ] Resin template testing uses a temporary UUID, reports exit/ASN/xAI status, and account retries rotate UUID without changing the proxy inside one account flow.
 - [ ] Email provider save/test APIs require `MONITOR_TOKEN`; API Key, JWT, and password values never appear in GET responses or rendered HTML.
 - [ ] Blank email-provider secret inputs preserve stored values, explicit clear removes them, and connectivity tests do not mutate `config.json`.

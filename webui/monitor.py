@@ -45,6 +45,11 @@ try:
         save_email_provider_config,
         test_email_provider_config,
     )
+    from webui.grok2api_sync import (
+        read_sync_config as read_grok2api_sync_config,
+        save_sync_config as save_grok2api_sync_config,
+        test_sync_config as test_grok2api_sync_config,
+    )
     from webui.process_utils import (
         find_managed_processes,
         terminate_managed_processes,
@@ -82,6 +87,11 @@ except ImportError:  # running as script from webui/
         read_email_provider_config,
         save_email_provider_config,
         test_email_provider_config,
+    )
+    from grok2api_sync import (  # type: ignore
+        read_sync_config as read_grok2api_sync_config,
+        save_sync_config as save_grok2api_sync_config,
+        test_sync_config as test_grok2api_sync_config,
     )
     from process_utils import (  # type: ignore
         find_managed_processes,
@@ -1031,6 +1041,17 @@ HTML = r"""<!DOCTYPE html>
   .control-panel { padding: 12px 16px; }
   .control-panel .section-head { min-height: 24px; margin-bottom: 8px; }
   .control-panel .msg:empty { display: none; }
+  .sync-config-grid {
+    display: grid;
+    grid-template-columns: auto minmax(260px, 1.2fr) minmax(260px, 1fr) auto;
+    gap: 12px;
+    align-items: end;
+  }
+  .sync-toggle { min-height: 38px; display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 13px; white-space: nowrap; }
+  .sync-toggle input { width: auto; min-height: 0; margin: 0; }
+  .sync-key-row { display: flex; gap: 8px; }
+  .sync-key-row button { flex: 0 0 auto; }
+  .sync-actions { display: flex; gap: 8px; }
   .field { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
   .field label { color: var(--muted); font-size: 12px; font-weight: 560; }
   input, select, textarea, button { font: inherit; letter-spacing: 0; }
@@ -1609,6 +1630,8 @@ HTML = r"""<!DOCTYPE html>
   }
   @media (max-width: 1120px) {
     .control-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .sync-config-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .sync-actions { grid-column: 1 / -1; }
     .field-token { grid-column: span 2; }
     .control-actions { grid-column: 1 / -1; padding-top: 14px; border-top: 1px solid var(--border); }
     .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -1629,6 +1652,9 @@ HTML = r"""<!DOCTYPE html>
     .field-token, .field-mode { grid-column: 1 / -1; }
     .control-actions { justify-content: stretch; }
     .control-actions button { flex: 1 1 0; padding-inline: 8px; }
+    .sync-config-grid { grid-template-columns: minmax(0, 1fr); }
+    .sync-actions { grid-column: auto; }
+    .sync-actions button { flex: 1 1 0; }
     .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .metric { padding: 14px; }
     .metric .value { font-size: 23px; }
@@ -1798,7 +1824,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="control-grid">
       <div class="field field-token">
         <label for="monitor-token">访问令牌</label>
-        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains()" onblur="getToken()"/>
+        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshGrok2apiSync()" onblur="getToken()"/>
       </div>
       <div class="field field-mode">
         <label for="mode">运行模式</label>
@@ -1826,6 +1852,35 @@ HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="msg" id="ctrl-msg" role="status" aria-live="polite"></div>
+  </section>
+
+  <section class="card panel sync-config-panel">
+    <div class="section-head">
+      <h2>Grok2API 云端同步</h2>
+      <span class="section-meta mono" id="grok2api-sync-status">等待读取</span>
+    </div>
+    <div class="sync-config-grid">
+      <label class="sync-toggle" for="grok2api-sync-enabled">
+        <input id="grok2api-sync-enabled" type="checkbox"/>
+        注册成功后自动同步
+      </label>
+      <div class="field">
+        <label for="grok2api-sync-url">服务根地址</label>
+        <input id="grok2api-sync-url" type="url" autocomplete="off" placeholder="https://grok2api.example.com"/>
+      </div>
+      <div class="field">
+        <label for="grok2api-sync-app-key">app_key（管理密钥）</label>
+        <div class="sync-key-row">
+          <input id="grok2api-sync-app-key" type="password" autocomplete="new-password" placeholder="尚未配置"/>
+          <button type="button" id="grok2api-sync-clear" onclick="clearGrok2apiSyncKey()" disabled>清除</button>
+        </div>
+      </div>
+      <div class="sync-actions">
+        <button type="button" onclick="testGrok2apiSync(this)">测试连接</button>
+        <button type="button" class="primary" onclick="saveGrok2apiSync(this)">保存配置</button>
+      </div>
+    </div>
+    <div class="msg" id="grok2api-sync-msg" role="status" aria-live="polite"></div>
   </section>
 
   <section class="help-view" id="help-view" aria-labelledby="help-view-title" hidden>
@@ -1868,7 +1923,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="faq-tools">
           <label class="sr-only" for="faq-search">搜索常见问题</label>
           <input id="faq-search" type="search" placeholder="搜索错误码或现象" autocomplete="off" oninput="filterFaq(this.value)"/>
-          <span class="faq-count mono" id="faq-count">12 项</span>
+          <span class="faq-count mono" id="faq-count">14 项</span>
         </div>
         <div class="faq-grid" id="faq-grid">
           <details class="faq-item" data-faq-item data-search="令牌 token unauthorized 401 保存设置 启动">
@@ -1890,6 +1945,10 @@ HTML = r"""<!DOCTYPE html>
           <details class="faq-item" data-faq-item data-search="cpa 没新增 invalid_grant access denied 503 auth unavailable oauth 入库 目录 管理密钥">
             <summary>CPA 没新增，或出现 invalid_grant / 503</summary>
             <div class="faq-answer">先检查 <code>cpa_auto_add</code>、auth 目录、远程 CPA 地址和管理密钥。<code>invalid_grant Access denied</code> 表示 OAuth 交换被拒；503 表示 CPA 当前没有可用 xAI auth。</div>
+          </details>
+          <details class="faq-item" data-faq-item data-search="grok2api 云端 同步 sso app_key 401 404 tokens add">
+            <summary>Grok2API 云端同步失败</summary>
+            <div class="faq-answer">先在控制台的“Grok2API 云端同步”卡片测试连接。这里使用目标服务的 <code>app.app_key</code>，并直接上传原始 SSO；它独立于 <code>cpa_auto_add</code> 和本地 <code>grok2api_auth_dir</code>。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="permission denied access chat endpoint referrer grok build base_url oauth">
             <summary>调用模型提示 permission-denied</summary>
@@ -1960,14 +2019,14 @@ HTML = r"""<!DOCTYPE html>
         <div class="resin-config-grid">
           <div class="field">
             <label for="resin-template-input">Resin 代理模板</label>
-            <input id="resin-template-input" type="password" autocomplete="new-password" placeholder="http://node.{uuid}:password@127.0.0.1:9200"/>
+            <input id="resin-template-input" type="text" autocomplete="off" oninput="this.dataset.dirty='true'" placeholder="http://node.{uuid}:password@127.0.0.1:9200"/>
           </div>
           <div class="button-group">
             <button id="resin-test-button" onclick="testResinTemplate()">测试模板</button>
             <button class="danger" id="resin-clear-button" onclick="clearResinTemplate()">清除模板</button>
           </div>
         </div>
-        <p id="resin-template-note">输入框留空会保留已保存模板；测试不会保存新模板。</p>
+        <p id="resin-template-note">输入框会自动回显已保存模板；测试不会保存新模板。</p>
         <div class="resin-status" id="resin-status" aria-live="polite"></div>
       </section>
 
@@ -2420,6 +2479,80 @@ async function api(path, opts) {
   if (j && j.ok === false) throw new Error(j.error || j.message || "request failed");
   return j;
 }
+let grok2apiSyncKeyConfigured = false;
+let grok2apiSyncClearKey = false;
+function renderGrok2apiSync(data) {
+  const state = data || {};
+  document.getElementById("grok2api-sync-enabled").checked = !!state.enabled;
+  document.getElementById("grok2api-sync-url").value = state.url || "";
+  const keyInput = document.getElementById("grok2api-sync-app-key");
+  grok2apiSyncKeyConfigured = !!state.app_key_configured;
+  grok2apiSyncClearKey = false;
+  keyInput.value = "";
+  keyInput.placeholder = grok2apiSyncKeyConfigured ? "已配置，留空保留" : "尚未配置";
+  const clearButton = document.getElementById("grok2api-sync-clear");
+  clearButton.disabled = !grok2apiSyncKeyConfigured;
+  clearButton.textContent = "清除";
+  const status = document.getElementById("grok2api-sync-status");
+  status.textContent = state.enabled ? "已启用" : "已关闭";
+  status.className = "section-meta mono " + (state.enabled ? "ok" : "");
+}
+async function refreshGrok2apiSync(authHelp = false) {
+  try {
+    renderGrok2apiSync(await api("/api/grok2api-sync", { authHelp }));
+  } catch (e) {
+    if (authHelp) setMsg("grok2api-sync-msg", String(e.message || e), "err");
+  }
+}
+function clearGrok2apiSyncKey() {
+  if (!grok2apiSyncKeyConfigured) return;
+  grok2apiSyncClearKey = !grok2apiSyncClearKey;
+  const input = document.getElementById("grok2api-sync-app-key");
+  const button = document.getElementById("grok2api-sync-clear");
+  input.value = "";
+  input.placeholder = grok2apiSyncClearKey ? "保存后清除已配置密钥" : "已配置，留空保留";
+  button.textContent = grok2apiSyncClearKey ? "取消清除" : "清除";
+}
+function grok2apiSyncBody() {
+  return {
+    enabled: document.getElementById("grok2api-sync-enabled").checked,
+    url: document.getElementById("grok2api-sync-url").value.trim(),
+    app_key: document.getElementById("grok2api-sync-app-key").value.trim(),
+    clear_app_key: grok2apiSyncClearKey,
+  };
+}
+async function saveGrok2apiSync(button) {
+  button.disabled = true;
+  try {
+    const result = await api("/api/grok2api-sync", {
+      method: "POST",
+      body: JSON.stringify(grok2apiSyncBody()),
+    });
+    renderGrok2apiSync(result);
+    setMsg("grok2api-sync-msg", "Grok2API 云同步配置已保存，新启动的注册任务将使用此配置", "ok");
+  } catch (e) {
+    setMsg("grok2api-sync-msg", String(e.message || e), "err");
+  }
+  button.disabled = false;
+}
+async function testGrok2apiSync(button) {
+  button.disabled = true;
+  const body = grok2apiSyncBody();
+  try {
+    const result = await api("/api/grok2api-sync/test", {
+      method: "POST",
+      body: JSON.stringify({
+        url: body.url,
+        app_key: body.app_key,
+        clear_app_key: body.clear_app_key,
+      }),
+    });
+    setMsg("grok2api-sync-msg", result.detail || "连接正常", "ok");
+  } catch (e) {
+    setMsg("grok2api-sync-msg", String(e.message || e), "err");
+  }
+  button.disabled = false;
+}
 function proxyStatusLabel(status) {
   return ({ healthy: "健康", unhealthy: "异常", cooldown: "冷却", testing: "检测中", unknown: "未检测" })[status] || "未检测";
 }
@@ -2456,7 +2589,7 @@ function renderResinStatus(resin) {
     ["延迟 / xAI", latency + " / " + xai],
   ].map(([label, value]) => `<div class="resin-status-item"><div class="resin-status-label">${esc(label)}</div><div class="resin-status-value mono">${esc(value)}</div></div>`).join("");
   document.getElementById("resin-template-note").textContent = data.configured
-    ? "已保存模板；输入框留空会保留现值。成功 " + (data.success_count || 0) + " / 失败 " + (data.failure_count || 0) + " / 风控 " + (data.risk_count || 0)
+    ? "已回显当前模板。成功 " + (data.success_count || 0) + " / 失败 " + (data.failure_count || 0) + " / 风控 " + (data.risk_count || 0)
     : "尚未保存模板；必须且只能在用户名中包含一个 {uuid}。";
   document.getElementById("resin-clear-button").disabled = !data.configured;
 }
@@ -2473,7 +2606,7 @@ async function saveProxyMode() {
       clear_resin_template: clearResinTemplatePending,
     }) });
     clearResinTemplatePending = false;
-    document.getElementById("resin-template-input").value = "";
+    document.getElementById("resin-template-input").dataset.dirty = "false";
     renderProxyPool(result);
     setMsg("proxy-msg", "代理来源配置已保存", "ok");
   } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
@@ -2495,7 +2628,9 @@ async function testResinTemplate() {
 async function clearResinTemplate() {
   if (!confirm("清除已保存的 Resin 模板？当前为 Resin 模式时将同时切换为直连。")) return;
   clearResinTemplatePending = true;
-  document.getElementById("resin-template-input").value = "";
+  const templateInput = document.getElementById("resin-template-input");
+  templateInput.value = "";
+  templateInput.dataset.dirty = "false";
   if (document.getElementById("proxy-mode-select").value === "resin") {
     document.getElementById("proxy-mode-select").value = "direct";
     selectProxyMode("direct");
@@ -2519,6 +2654,10 @@ function renderProxyPool(data) {
     ? ("更新 " + proxyTime(proxyData.updated_at) + (proxyData.mode_explicit ? "" : " · 兼容推断"))
     : "尚未写入";
   document.getElementById("proxy-mode-select").value = proxyData.mode || "direct";
+  const templateInput = document.getElementById("resin-template-input");
+  if (templateInput.dataset.dirty !== "true") {
+    templateInput.value = (proxyData.resin || {}).template || "";
+  }
   selectProxyMode(proxyData.mode || "direct");
   renderResinStatus(proxyData.resin || {});
 
@@ -3186,6 +3325,7 @@ controlFieldIds.forEach(id => {
 // full stats once on load
 refreshStats(false);
 refreshRecovery();
+refreshGrok2apiSync(false);
 setInterval(refreshRecovery, 5000);
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
@@ -3301,7 +3441,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/grok2api-sync"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -3342,6 +3482,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/email-provider":
             try:
                 self._json(200, read_email_provider_config())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/grok2api-sync":
+            try:
+                self._json(200, read_grok2api_sync_config())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -3468,6 +3614,33 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("provider"),
                     body.get("settings") or {},
                     clear_secrets=body.get("clear_secrets"),
+                )
+                self._json(200 if result.get("ok") else 424, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/grok2api-sync":
+            try:
+                result = save_grok2api_sync_config(
+                    body.get("enabled", False),
+                    body.get("url", ""),
+                    body.get("app_key", ""),
+                    clear_app_key=bool(body.get("clear_app_key", False)),
+                )
+                self._json(200, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/grok2api-sync/test":
+            try:
+                result = test_grok2api_sync_config(
+                    body.get("url", ""),
+                    body.get("app_key", ""),
+                    clear_app_key=bool(body.get("clear_app_key", False)),
                 )
                 self._json(200 if result.get("ok") else 424, result)
             except ValueError as e:

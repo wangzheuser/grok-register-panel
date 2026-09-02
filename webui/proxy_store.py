@@ -540,6 +540,7 @@ def read_proxy_pool() -> dict:
         "mode_explicit": mode_explicit,
         "resin": {
             "configured": bool(resin_template),
+            "template": resin_template,
             "display_url": redact_proxy(resin_template) if resin_template else "",
             "status": resin_state.get("status") or "unknown",
             "exit_ip": resin_state.get("exit_ip") or "",

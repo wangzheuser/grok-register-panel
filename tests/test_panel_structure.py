@@ -106,7 +106,7 @@ def test_help_and_faq_module():
     assert 'body.help-view-open #dashboard-view > :not(#help-view) { display: none; }' in html
     assert 'role="tablist"' in html
     assert 'id="faq-search"' in html
-    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 13
+    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 14
     assert 'policy=deny' in html
     assert '账号补录' in html
     assert '成功项会从待补录队列移除' in html
@@ -134,7 +134,9 @@ def test_proxy_pool_panel_structure():
     assert 'id="proxy-body"' in html
     assert 'id="proxy-mode-select"' in html
     assert 'id="proxy-resin-panel"' in html
-    assert 'id="resin-template-input" type="password"' in html
+    assert 'id="resin-template-input" type="text"' in html
+    assert 'templateInput.value = (proxyData.resin || {}).template || "";' in mon
+    assert 'templateInput.dataset.dirty !== "true"' in mon
     assert 'function refreshProxies(' in mon
     assert 'function renderProxyPool(' in mon
     assert 'function importProxyInput(' in mon
