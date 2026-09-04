@@ -67,12 +67,13 @@ MailPoolHub 必须作为独立服务运行，注册面板只连接它，不会�
 不会创建邮箱。注册时 MailPoolHub API 始终直连，不会经过注册代理；创建的邮箱在
 收到验证码或等待超时后自动删除，提交邮箱前失败的实例由 900 秒 TTL 回收。
 
-### 可选：注册成功后同步到 Grok2API
+### 可选：注册成功后同步到 Go 版 Grok2API
 
-控制台提供“Grok2API 云端同步”配置卡。开启后只需填写 Grok2API 服务根地址和目标
-服务的 `app.app_key`，保存前可先测试连接。账号完成本地保存后，面板会在后台调用
-`POST /admin/api/tokens/add` 上传原始 SSO；同步异常只写入日志，不会把已注册账号计为
-失败。这里的远程 SSO 同步与 `cpa_auto_add`、本地 `grok2api_auth_dir` 互相独立。
+控制台提供“Grok2API 云端同步”配置卡。开启后填写服务根地址、管理员用户名和密码，
+保存前可测试登录鉴权。账号完成本地保存后，面板会复用管理员会话，在后台调用
+`POST /api/admin/v1/accounts/web/import`，以 Multipart 文件把邮箱和原始 SSO 导入为
+Grok Web 账号。同步异常只写入日志，不会把已注册账号计为失败；不会继续转换 Build
+或同步 Console。该功能与 `cpa_auto_add`、本地 `grok2api_auth_dir` 互相独立。
 
 ### 配置 Resin UUID 代理模板
 

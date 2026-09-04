@@ -1043,7 +1043,7 @@ HTML = r"""<!DOCTYPE html>
   .control-panel .msg:empty { display: none; }
   .sync-config-grid {
     display: grid;
-    grid-template-columns: auto minmax(260px, 1.2fr) minmax(260px, 1fr) auto;
+    grid-template-columns: auto minmax(240px, 1.2fr) minmax(140px, .65fr) minmax(240px, 1fr) auto;
     gap: 12px;
     align-items: end;
   }
@@ -1869,10 +1869,14 @@ HTML = r"""<!DOCTYPE html>
         <input id="grok2api-sync-url" type="url" autocomplete="off" placeholder="https://grok2api.example.com"/>
       </div>
       <div class="field">
-        <label for="grok2api-sync-app-key">app_key（管理密钥）</label>
+        <label for="grok2api-sync-username">管理员用户名</label>
+        <input id="grok2api-sync-username" type="text" autocomplete="username" placeholder="admin"/>
+      </div>
+      <div class="field">
+        <label for="grok2api-sync-password">管理员密码</label>
         <div class="sync-key-row">
-          <input id="grok2api-sync-app-key" type="password" autocomplete="new-password" placeholder="尚未配置"/>
-          <button type="button" id="grok2api-sync-clear" onclick="clearGrok2apiSyncKey()" disabled>清除</button>
+          <input id="grok2api-sync-password" type="password" autocomplete="new-password" placeholder="尚未配置"/>
+          <button type="button" id="grok2api-sync-clear" onclick="clearGrok2apiSyncPassword()" disabled>清除</button>
         </div>
       </div>
       <div class="sync-actions">
@@ -1946,9 +1950,9 @@ HTML = r"""<!DOCTYPE html>
             <summary>CPA 没新增，或出现 invalid_grant / 503</summary>
             <div class="faq-answer">先检查 <code>cpa_auto_add</code>、auth 目录、远程 CPA 地址和管理密钥。<code>invalid_grant Access denied</code> 表示 OAuth 交换被拒；503 表示 CPA 当前没有可用 xAI auth。</div>
           </details>
-          <details class="faq-item" data-faq-item data-search="grok2api 云端 同步 sso app_key 401 404 tokens add">
+          <details class="faq-item" data-faq-item data-search="grok2api 云端 同步 sso 管理员 用户名 密码 401 404 web import">
             <summary>Grok2API 云端同步失败</summary>
-            <div class="faq-answer">先在控制台的“Grok2API 云端同步”卡片测试连接。这里使用目标服务的 <code>app.app_key</code>，并直接上传原始 SSO；它独立于 <code>cpa_auto_add</code> 和本地 <code>grok2api_auth_dir</code>。</div>
+            <div class="faq-answer">先在控制台的“Grok2API 云端同步”卡片测试连接。这里使用 Go 版 Grok2API 的管理员用户名和密码建立短期会话，再把原始 SSO 导入为 Grok Web 账号；它独立于 <code>cpa_auto_add</code> 和本地 <code>grok2api_auth_dir</code>。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="permission denied access chat endpoint referrer grok build base_url oauth">
             <summary>调用模型提示 permission-denied</summary>
@@ -2479,23 +2483,27 @@ async function api(path, opts) {
   if (j && j.ok === false) throw new Error(j.error || j.message || "request failed");
   return j;
 }
-let grok2apiSyncKeyConfigured = false;
-let grok2apiSyncClearKey = false;
+let grok2apiSyncPasswordConfigured = false;
+let grok2apiSyncClearPassword = false;
 function renderGrok2apiSync(data) {
   const state = data || {};
   document.getElementById("grok2api-sync-enabled").checked = !!state.enabled;
   document.getElementById("grok2api-sync-url").value = state.url || "";
-  const keyInput = document.getElementById("grok2api-sync-app-key");
-  grok2apiSyncKeyConfigured = !!state.app_key_configured;
-  grok2apiSyncClearKey = false;
-  keyInput.value = "";
-  keyInput.placeholder = grok2apiSyncKeyConfigured ? "已配置，留空保留" : "尚未配置";
+  document.getElementById("grok2api-sync-username").value = state.username || "admin";
+  const passwordInput = document.getElementById("grok2api-sync-password");
+  grok2apiSyncPasswordConfigured = !!state.password_configured;
+  grok2apiSyncClearPassword = false;
+  passwordInput.value = "";
+  passwordInput.placeholder = grok2apiSyncPasswordConfigured ? "已配置，留空保留" : "尚未配置";
   const clearButton = document.getElementById("grok2api-sync-clear");
-  clearButton.disabled = !grok2apiSyncKeyConfigured;
+  clearButton.disabled = !grok2apiSyncPasswordConfigured;
   clearButton.textContent = "清除";
   const status = document.getElementById("grok2api-sync-status");
   status.textContent = state.enabled ? "已启用" : "已关闭";
   status.className = "section-meta mono " + (state.enabled ? "ok" : "");
+  if (state.legacy_app_key_configured) {
+    setMsg("grok2api-sync-msg", "检测到旧版 app_key 配置，请填写管理员密码并保存以完成迁移", "err");
+  }
 }
 async function refreshGrok2apiSync(authHelp = false) {
   try {
@@ -2504,21 +2512,22 @@ async function refreshGrok2apiSync(authHelp = false) {
     if (authHelp) setMsg("grok2api-sync-msg", String(e.message || e), "err");
   }
 }
-function clearGrok2apiSyncKey() {
-  if (!grok2apiSyncKeyConfigured) return;
-  grok2apiSyncClearKey = !grok2apiSyncClearKey;
-  const input = document.getElementById("grok2api-sync-app-key");
+function clearGrok2apiSyncPassword() {
+  if (!grok2apiSyncPasswordConfigured) return;
+  grok2apiSyncClearPassword = !grok2apiSyncClearPassword;
+  const input = document.getElementById("grok2api-sync-password");
   const button = document.getElementById("grok2api-sync-clear");
   input.value = "";
-  input.placeholder = grok2apiSyncClearKey ? "保存后清除已配置密钥" : "已配置，留空保留";
-  button.textContent = grok2apiSyncClearKey ? "取消清除" : "清除";
+  input.placeholder = grok2apiSyncClearPassword ? "保存后清除已配置密码" : "已配置，留空保留";
+  button.textContent = grok2apiSyncClearPassword ? "取消清除" : "清除";
 }
 function grok2apiSyncBody() {
   return {
     enabled: document.getElementById("grok2api-sync-enabled").checked,
     url: document.getElementById("grok2api-sync-url").value.trim(),
-    app_key: document.getElementById("grok2api-sync-app-key").value.trim(),
-    clear_app_key: grok2apiSyncClearKey,
+    username: document.getElementById("grok2api-sync-username").value.trim() || "admin",
+    password: document.getElementById("grok2api-sync-password").value,
+    clear_password: grok2apiSyncClearPassword,
   };
 }
 async function saveGrok2apiSync(button) {
@@ -2543,8 +2552,9 @@ async function testGrok2apiSync(button) {
       method: "POST",
       body: JSON.stringify({
         url: body.url,
-        app_key: body.app_key,
-        clear_app_key: body.clear_app_key,
+        username: body.username,
+        password: body.password,
+        clear_password: body.clear_password,
       }),
     });
     setMsg("grok2api-sync-msg", result.detail || "连接正常", "ok");
@@ -3626,8 +3636,9 @@ class Handler(BaseHTTPRequestHandler):
                 result = save_grok2api_sync_config(
                     body.get("enabled", False),
                     body.get("url", ""),
-                    body.get("app_key", ""),
-                    clear_app_key=bool(body.get("clear_app_key", False)),
+                    body.get("username", "admin"),
+                    body.get("password", ""),
+                    clear_password=bool(body.get("clear_password", False)),
                 )
                 self._json(200, result)
             except ValueError as e:
@@ -3639,8 +3650,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = test_grok2api_sync_config(
                     body.get("url", ""),
-                    body.get("app_key", ""),
-                    clear_app_key=bool(body.get("clear_app_key", False)),
+                    body.get("username", "admin"),
+                    body.get("password", ""),
+                    clear_password=bool(body.get("clear_password", False)),
                 )
                 self._json(200 if result.get("ok") else 424, result)
             except ValueError as e:

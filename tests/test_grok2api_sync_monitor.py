@@ -28,7 +28,7 @@ def request(url: str, *, token: str = "", method: str = "GET", payload=None):
 
 def test_monitor_grok2api_sync_config_auth_and_redaction(tmp_path):
     token = "monitor-test-token"
-    secret = "grok2api-admin-secret"
+    secret = "grok2api-admin-password"
     old_token = os.environ.get("MONITOR_TOKEN")
     old_paths = grok2api_sync.CONFIG_PATH, grok2api_sync.LOCK_PATH
     grok2api_sync.CONFIG_PATH = tmp_path / "config.json"
@@ -47,7 +47,8 @@ def test_monitor_grok2api_sync_config_auth_and_redaction(tmp_path):
             payload={
                 "enabled": True,
                 "url": "https://grok.example/",
-                "app_key": secret,
+                "username": "operator",
+                "password": secret,
             },
         )
         assert status == 200
@@ -55,30 +56,32 @@ def test_monitor_grok2api_sync_config_auth_and_redaction(tmp_path):
         saved = json.loads(body)
         assert saved["enabled"] is True
         assert saved["url"] == "https://grok.example"
-        assert saved["app_key_configured"] is True
+        assert saved["username"] == "operator"
+        assert saved["password_configured"] is True
+        assert saved["legacy_app_key_configured"] is False
 
         status, body = request(base + "/api/grok2api-sync", token=token)
         assert status == 200
         assert secret.encode() not in body
-        assert json.loads(body)["app_key_configured"] is True
+        assert json.loads(body)["password_configured"] is True
 
         status, body = request(
             base + "/api/grok2api-sync",
             token=token,
             method="POST",
-            payload={"enabled": False, "url": "https://grok.example", "app_key": ""},
+            payload={"enabled": False, "url": "https://grok.example", "username": "operator", "password": ""},
         )
         assert status == 200
-        assert json.loads(body)["app_key_configured"] is True
+        assert json.loads(body)["password_configured"] is True
 
         status, body = request(
             base + "/api/grok2api-sync",
             token=token,
             method="POST",
-            payload={"enabled": False, "url": "", "clear_app_key": True},
+            payload={"enabled": False, "url": "", "username": "admin", "clear_password": True},
         )
         assert status == 200
-        assert json.loads(body)["app_key_configured"] is False
+        assert json.loads(body)["password_configured"] is False
     finally:
         server.shutdown()
         server.server_close()
@@ -92,13 +95,13 @@ def test_monitor_grok2api_sync_config_auth_and_redaction(tmp_path):
 
 def test_monitor_grok2api_connection_test_is_protected_and_redacted(monkeypatch):
     token = "monitor-test-token"
-    secret = "grok2api-admin-secret"
+    secret = "grok2api-admin-password"
     old_token = os.environ.get("MONITOR_TOKEN")
     os.environ["MONITOR_TOKEN"] = token
     calls = []
 
-    def fake_test(url, app_key, *, clear_app_key=False):
-        calls.append((url, app_key, clear_app_key))
+    def fake_test(url, username, password, *, clear_password=False):
+        calls.append((url, username, password, clear_password))
         return {"ok": True, "status_code": 200, "detail": "连接正常"}
 
     monkeypatch.setattr(monitor, "test_grok2api_sync_config", fake_test)
@@ -107,7 +110,7 @@ def test_monitor_grok2api_connection_test_is_protected_and_redacted(monkeypatch)
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
-        payload = {"url": "https://grok.example", "app_key": secret}
+        payload = {"url": "https://grok.example", "username": "operator", "password": secret}
         assert request(base + "/api/grok2api-sync/test", method="POST", payload=payload)[0] == 401
         status, body = request(
             base + "/api/grok2api-sync/test",
@@ -117,7 +120,7 @@ def test_monitor_grok2api_connection_test_is_protected_and_redacted(monkeypatch)
         )
         assert status == 200
         assert secret.encode() not in body
-        assert calls == [("https://grok.example", secret, False)]
+        assert calls == [("https://grok.example", "operator", secret, False)]
     finally:
         server.shutdown()
         server.server_close()

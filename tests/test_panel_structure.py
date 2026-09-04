@@ -123,6 +123,18 @@ def test_help_and_faq_module():
     assert '—' not in html
     assert '–' not in html
 
+def test_grok2api_sync_panel_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="grok2api-sync-enabled"' in html
+    assert 'id="grok2api-sync-url"' in html
+    assert 'id="grok2api-sync-username"' in html
+    assert 'id="grok2api-sync-password" type="password"' in html
+    assert 'grok2api-sync-app-key' not in html
+    assert 'legacy_app_key_configured' in mon
+    assert '/api/grok2api-sync/test' in mon
+
+
 def test_proxy_pool_panel_structure():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]

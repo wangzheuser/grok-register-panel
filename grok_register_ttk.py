@@ -230,7 +230,8 @@ DEFAULT_CONFIG = {
     # Grok2API 云端 SSO 同步（独立于 CPA/OAuth auth 输出）
     "grok2api_sync_enabled": False,
     "grok2api_sync_url": "",
-    "grok2api_sync_app_key": "",
+    "grok2api_sync_username": "admin",
+    "grok2api_sync_password": "",
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     "mailpoolhub_api_base": "http://127.0.0.1:8080/api/v1",

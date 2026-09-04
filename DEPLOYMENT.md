@@ -42,16 +42,19 @@ chmod 600 config.json
 原值，只有显式点“清除”并保存才会删除。连接测试使用当前表单内容但不会落盘。
 配置仍写入 `config.json`，原子更新并保持 `0600`，其它已有配置项不会被覆盖。
 
-需要把新注册账号同步到远程 Grok2API 时，在控制台的“Grok2API 云端同步”卡片配置：
+需要把新注册账号同步到 Go 版 Grok2API 时，在控制台的“Grok2API 云端同步”卡片配置：
 
 - `grok2api_sync_enabled`: 显式开启或关闭
-- `grok2api_sync_url`: Grok2API 服务根地址，不包含 `/admin/api/...`
-- `grok2api_sync_app_key`: 目标服务的 `app.app_key`，不是普通调用 API Key
+- `grok2api_sync_url`: Grok2API 服务根地址，不包含 `/api/admin/v1/...`
+- `grok2api_sync_username`: 管理员用户名，默认 `admin`
+- `grok2api_sync_password`: 管理员密码
 
-连接测试只调用 `/admin/api/verify`，不会发送账号。注册成功并完成本地账号文件保存后，
-程序在后台把原始 SSO 提交到 `/admin/api/tokens/add`；失败只记录告警，不改变本地注册
-成功状态。该功能独立于 `cpa_auto_add`；现有 `grok2api_auth_dir` 仍只负责写本地 OAuth
-auth JSON。远程请求不会使用注册代理或环境代理。
+连接测试会临时登录、读取 `/api/admin/v1/me` 并注销，不发送账号。注册成功并完成本地
+账号文件保存后，程序缓存管理员会话，在后台通过 `/api/admin/v1/accounts/web/import`
+把邮箱和原始 SSO 导入为 Grok Web 账号。同步失败只记录告警，不改变本地注册成功状态。
+该功能独立于 `cpa_auto_add`；现有 `grok2api_auth_dir` 仍只负责写本地 OAuth auth JSON。
+远程请求不会使用注册代理或环境代理。旧 `grok2api_sync_app_key` 不再生效，在 Web 面板
+重新填写管理员密码并保存后会自动移除。
 
 使用独立部署的 MailPoolHub 时配置：
 
