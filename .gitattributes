@@ -1,0 +1,4 @@
+# Batch files must keep CRLF line endings on every checkout,
+# otherwise cmd.exe can misparse labels and parenthesized blocks.
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -24,34 +24,26 @@
    ```cmd
    cd C:\你的路径\grok-register-panel
    ```
-3. 在此文件夹内，创建一个 Python 专属虚拟环境（**这一步只需要做一次**）：
-   ```cmd
-   python -m venv .venv
-   ```
-4. **激活虚拟环境**（关键！运行后，命令行的最左边会出现 `(.venv)` 这个标志，代表你进去了）：
-   ```cmd
-   .venv\Scripts\activate
-   ```
-5. **安装依赖和浏览器内核**：
-   ```cmd
-   pip install -r requirements.txt
-   python -m camoufox fetch
-   ```
+3. **一键启动（推荐）**：直接运行根目录下的 `start.bat`（双击或在 cmd 中执行），脚本会自动完成所有准备工作：
 
-### 第 2 步：启动控制台面板
-当你环境装好后，每次想启动面板，只需在这个文件夹下的 cmd 里执行：
+   - 自动查找 Python 并创建 `.venv` 虚拟环境（只需一次）；
+   - **自动检测并安装项目需要的所有依赖**：逐项校验 `requirements.txt` 中的 Python 包及代码实际用到的第三方模块，发现缺失或版本不符时自动安装修复，并自动下载 Camoufox 浏览器内核；
+   - 首次启动若还没有面板密码，会在命令行提示你输入管理 token（MONITOR_TOKEN），输入后**自动写入本地 `.env` 配置文件**（该文件已被 git 忽略，不会进仓库）——下次启动直接复用，无需再次输入；
+   - 全部就绪后自动启动面板服务。
 
-1. **设置面板的安全密码**（这是为了防止你的面板在公网被别人扫到偷用，密码自己随便编）：
-   ```cmd
-   set MONITOR_TOKEN=admin123
-   ```
-2. **启动面板服务**：
-   ```cmd
-   .venv\Scripts\python.exe webui/monitor.py
-   ```
-   *(注意：请务必使用带 `.venv\Scripts` 前缀的命令，这样才能确保调用的是刚装好依赖的虚拟环境！)*
+4. 启动成功后，直接在浏览器打开：[http://127.0.0.1:8787](http://127.0.0.1:8787)，输入你设置的密码即可登录。
 
-3. 启动成功后，直接在浏览器打开：[http://127.0.0.1:8787](http://127.0.0.1:8787)。输入刚才设的密码 `admin123` 即可登录。
+### 手动方式（可选，用于排查问题）
+
+```cmd
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python -m camoufox fetch
+set MONITOR_TOKEN=admin123
+.venv\Scripts\python.exe webui/monitor.py
+```
+*(注意：请务必使用带 `.venv\Scripts` 前缀的命令，这样才能确保调用的是刚装好依赖的虚拟环境！面板密码在公网部署时务必换成强随机值。)*
 
 ### 可选：使用 MailPoolHub 聚合邮箱
 
