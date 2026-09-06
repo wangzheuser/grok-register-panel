@@ -159,7 +159,7 @@ FIELD_DEFINITIONS = {
     "moemail_domain": {
         "label": "固定收信域名",
         "type": "domain",
-        "placeholder": "留空自动选择",
+        "placeholder": "留空自动选择；可填多个域名（逗号分隔自动轮询）",
     },
     "moemail_expiry_ms": {
         "label": "邮箱有效期",
@@ -294,6 +294,8 @@ def _normalize_value(name: str, value: object):
         normalized = _normalize_url(value)
         return normalized or definition.get("default", "")
     if field_type == "domain":
+        if name == "moemail_domain":
+            return _normalize_domains(value)
         text = _string(value).lstrip("@")
         if not text:
             return ""
@@ -507,6 +509,6 @@ def test_email_provider_config(
         "ok": bool(ok),
         "provider": normalized_provider,
         "provider_label": PROVIDER_LABELS[normalized_provider],
-        "detail": redact_log_line(str(detail))[:300],
+        "detail": redact_log_line(str(detail))[:1000],
         "checked_at": _utc_now(),
     }

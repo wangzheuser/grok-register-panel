@@ -180,8 +180,18 @@ def create_mailbox(
     if not key:
         raise Exception("MoeMail API Key 未配置（moemail_api_key）")
 
-    chosen = str(domain or "").strip().lstrip("@")
-    if not chosen:
+    fixed = [
+        d.strip().lstrip("@")
+        for d in re.split(r"[,，\s]+", str(domain or ""))
+        if d.strip()
+    ]
+    if len(fixed) > 1:
+        # 固定收信域名填了多个（逗号分隔）：按次轮询，均匀分摊到每个域名
+        chosen = fixed[_domain_index % len(fixed)]
+        _domain_index += 1
+    elif fixed:
+        chosen = fixed[0]
+    else:
         cleaned = [d.strip().lstrip("@") for d in (domains or []) if str(d).strip()]
         if not cleaned:
             cleaned = list_domains(http_get, base, key)

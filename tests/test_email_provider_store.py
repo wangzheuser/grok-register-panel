@@ -254,11 +254,34 @@ def test_mailpoolhub_secret_and_connectivity_validation():
         )
 
 
+def test_moemail_domain_accepts_multi_domain_list():
+    with IsolatedConfig() as config_path:
+        saved = email_provider_store.save_email_provider_config(
+            "moemail",
+            {
+                "moemail_api_base": "https://mail.example.com",
+                "moemail_api_key": "test-key",
+                "moemail_domain": "A.Example.com, @b.example，c.example",
+            },
+        )
+        assert saved["values"]["moemail_domain"] == "a.example.com,b.example,c.example"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        assert raw["moemail_domain"] == "a.example.com,b.example,c.example"
+
+        assert_config_error(
+            lambda: email_provider_store.save_email_provider_config(
+                "moemail", {"moemail_domain": "not a domain"}
+            )
+        )
+
+
 if __name__ == "__main__":
+
     test_provider_schema_and_defaults()
     test_secret_masking_preservation_clear_and_private_file()
     test_validation_rejects_unknown_fields_and_unsafe_values()
     test_connectivity_uses_unsaved_form_and_preserves_saved_secret()
     test_cloudflare_connectivity_uses_configured_port()
     test_mailpoolhub_secret_and_connectivity_validation()
+    test_moemail_domain_accepts_multi_domain_list()
     print("OK email provider store")

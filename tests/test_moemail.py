@@ -64,6 +64,36 @@ def test_domain_discovery_rotation_and_direct_requests():
     assert [method for method, _, _ in calls].count("GET") == 1
 
 
+def test_fixed_domain_list_rotation():
+    moemail.reset_runtime_state()
+
+    def http_post(url, **kwargs):
+        domain = kwargs["json"]["domain"]
+        return FakeResponse({"id": f"id-{domain}", "email": f"user@{domain}"})
+
+    def http_get(url, **kwargs):
+        raise AssertionError("fixed domain list should not query /api/config")
+
+    fixed = "a.example, b.example，c.example"
+    picks = [
+        moemail.create_mailbox(http_get, http_post, "https://mail.example", "test-key", domain=fixed, name="user")[0]
+        for _ in range(5)
+    ]
+    assert picks == [
+        "user@a.example",
+        "user@b.example",
+        "user@c.example",
+        "user@a.example",
+        "user@b.example",
+    ]
+
+    moemail.reset_runtime_state()
+    single = moemail.create_mailbox(
+        http_get, http_post, "https://mail.example", "test-key", domain="only.example", name="user"
+    )
+    assert single == ("user@only.example", "id-only.example")
+
+
 def test_wait_for_code_and_cleanup():
     deleted = []
 
@@ -111,6 +141,7 @@ def test_connectivity_probe():
 
     assert result[1] is True
     assert "one.example" in result[2]
+    assert "two.example" in result[2]
     assert seen[0][0] == "https://mail.example/api/config"
     assert seen[0][1]["proxies"] == {}
 
@@ -118,6 +149,7 @@ def test_connectivity_probe():
 if __name__ == "__main__":
     test_normalize_base()
     test_domain_discovery_rotation_and_direct_requests()
+    test_fixed_domain_list_rotation()
     test_wait_for_code_and_cleanup()
     test_connectivity_probe()
     print("OK moemail")

@@ -284,7 +284,7 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
                 domains = str(data.get("emailDomains") or data.get("email_domains") or "")
             detail = f"MoeMail 可达 HTTP {resp.status_code}"
             if domains:
-                detail += f"；域名 {domains[:80]}"
+                detail += f"；域名 {domains}"
             return "邮箱API", True, detail
 
         return "邮箱API", True, f"提供商 {provider} 跳过深度探测"
