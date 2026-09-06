@@ -116,9 +116,22 @@ def _run_child(count: int, workers: int) -> int:
         flush=True,
     )
     app.load_config()
+    # 面板任务控制 -> monitor_control.json -> 子进程内存配置（不落 config.json）
+    try:
+        control = json.loads(
+            (LOG_DIR / "monitor_control.json").read_text(encoding="utf-8") or "{}"
+        )
+    except (OSError, ValueError):
+        control = {}
+    for key in ("attempt_timeout_sec", "mail_code_wait"):
+        if control.get(key) is not None:
+            app.config[key] = control.get(key)
     app._wire_runtime_modules()
     print(
-        f"[batch] count={count} workers={workers} proxy={_redact_proxy(app.config.get('proxy'))}",
+        f"[batch] count={count} workers={workers} "
+        f"attempt_timeout={app.config.get('attempt_timeout_sec')} "
+        f"mail_wait={app.config.get('mail_code_wait')} "
+        f"proxy={_redact_proxy(app.config.get('proxy'))}",
         flush=True,
     )
     app.run_registration_cli(count)

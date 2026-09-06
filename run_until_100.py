@@ -11,7 +11,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from secure_files import append_private_text, ensure_private_dir
+from secure_files import append_private_text, atomic_write_json, ensure_private_dir
 from webui.blacklist_store import add_asn as add_blacklist_asn
 from webui.blacklist_store import read_blacklist
 from webui.process_utils import (
@@ -31,7 +31,10 @@ BASE0 = int(__import__("os").environ.get("ORCH_BASE_CPA", "0") or 0)
 TARGET_CPA = BASE0 + int(__import__("os").environ.get("ORCH_ADD_COUNT", "100") or 100)
 RISK_PAUSE = 10
 MAX_ROUNDS = 60
+ROUND_TIMEOUT_MIN = 1440
+ATTEMPT_TIMEOUT_SEC = 360
 CONTROL_FILE = LOG_DIR / "monitor_control.json"
+DRAIN_FILE = LOG_DIR / "batch-drain.json"
 
 
 def load_control() -> dict:
@@ -52,6 +55,7 @@ def resolve_batch_count(control: dict, default: int = 40) -> int:
 
 def apply_control() -> None:
     global WORKERS, BATCH_COUNT, RISK_PAUSE, TARGET_CPA, BASE0
+    global ROUND_TIMEOUT_MIN, ATTEMPT_TIMEOUT_SEC
     c = load_control()
     BATCH_COUNT = resolve_batch_count(c)
     if c.get("workers"):
@@ -64,6 +68,20 @@ def apply_control() -> None:
             RISK_PAUSE = max(1, int(c["risk_pause"]))
         except Exception:
             pass
+    try:
+        raw_round = c.get("round_timeout_min", 1440)
+        if raw_round is None:
+            raw_round = 1440
+        # 仅要求 >=0 的整数（0 = 不限制），不设上限校验；负数/非法值回落默认
+        n = int(raw_round)
+        ROUND_TIMEOUT_MIN = n if n >= 0 else 1440
+    except (TypeError, ValueError):
+        ROUND_TIMEOUT_MIN = 1440
+    try:
+        n = int(c.get("attempt_timeout_sec", 360))
+        ATTEMPT_TIMEOUT_SEC = n if n >= 0 else 360
+    except (TypeError, ValueError):
+        ATTEMPT_TIMEOUT_SEC = 360
     # 再跑 N 个：以当前 CPA 为基线
     add_count = c.get("add_count")
     if add_count is not None and str(add_count).strip() != "":
@@ -103,6 +121,33 @@ def cpa_count() -> int:
 def kill_batch() -> None:
     """Stop only batch processes that belong to this project root."""
     terminate_managed_processes(ROOT, ("run_batch_headless.py",))
+
+
+def request_drain() -> None:
+    """通知 worker 完成在跑任务后退出（宽限期内不杀进程）。"""
+    grace = drain_grace_secs()
+    atomic_write_json(
+        DRAIN_FILE,
+        {"ts": time.time(), "expire_at": time.time() + grace, "reason": "round_timeout"},
+    )
+
+
+def clear_drain() -> None:
+    try:
+        DRAIN_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def drain_grace_secs() -> int:
+    """收尾宽限：略大于单任务预算，保证在跑任务能自然结束。"""
+    if ATTEMPT_TIMEOUT_SEC > 0:
+        grace = ATTEMPT_TIMEOUT_SEC + 240
+    else:
+        grace = 900
+    return max(300, grace)
 
 
 def start_batch(count: int):
@@ -293,6 +338,7 @@ def batch_alive(pid: int) -> bool:
 def main():
     apply_control()
     kill_batch()
+    clear_drain()
     log(f"ORCH fixed start cpa_now={cpa_count()} base0={BASE0} target={TARGET_CPA} need={TARGET_CPA - cpa_count()}")
     need0 = TARGET_CPA - cpa_count()
     if need0 <= 0:
@@ -301,7 +347,7 @@ def main():
         log(f"final blocklist={sorted(read_blocklist_asns())}")
         return
 
-    log(f"rules: workers={WORKERS} batch_count={BATCH_COUNT} pause_on_risk_only={RISK_PAUSE} SSO ignored block={sorted(read_blocklist_asns())}")
+    log(f"rules: workers={WORKERS} batch_count={BATCH_COUNT} pause_on_risk_only={RISK_PAUSE} round_timeout={ROUND_TIMEOUT_MIN}m attempt_timeout={ATTEMPT_TIMEOUT_SEC}s SSO ignored block={sorted(read_blocklist_asns())}")
     
     round_i = 0
     while cpa_count() < TARGET_CPA and round_i < MAX_ROUNDS:
@@ -315,7 +361,9 @@ def main():
             log(f"start_batch failed: {e}")
             time.sleep(5)
             continue
+        clear_drain()
         t0 = time.time()
+        drain_deadline = None
         while True:
             time.sleep(15)
             try:
@@ -325,14 +373,19 @@ def main():
             risks = count_risk(logpath)
             oks = count_ok(logpath)
             delta = cpa_count() - BASE0
-            log(f"  mon ok={oks} risk={risks} cpa_delta={delta}/100 alive={alive}")
+            mon = f"  mon ok={oks} risk={risks} cpa_delta={delta}/100 alive={alive}"
+            if drain_deadline is not None:
+                mon += f" drain={max(0, int(drain_deadline - time.time()))}s"
+            log(mon)
             if cpa_count() >= TARGET_CPA:
                 log("TARGET reached")
                 kill_batch()
+                clear_drain()
                 break
             if risks >= RISK_PAUSE:
                 log(f"  HIT {RISK_PAUSE} 注册风控 rejects (risk={risks}), pause+blacklist")
                 kill_batch()
+                clear_drain()
                 try:
                     added = analyze_risks_and_expand(logpath)
                     log(f"  added={added} block={sorted(read_blocklist_asns())}")
@@ -341,14 +394,26 @@ def main():
                 break
             if not alive:
                 log("  batch exited")
+                clear_drain()
                 try:
                     analyze_risks_and_expand(logpath)
                 except Exception as e:
                     log(f"  analyze error: {e}")
                 break
-            if time.time() - t0 > 2400:
-                log("  round timeout 40m, restart")
+            round_secs = ROUND_TIMEOUT_MIN * 60
+            if ROUND_TIMEOUT_MIN > 0 and drain_deadline is None and time.time() - t0 > round_secs:
+                grace = drain_grace_secs()
+                log(
+                    f"  round timeout {ROUND_TIMEOUT_MIN}m, request drain "
+                    f"(wait<= {grace}s for in-flight attempts)"
+                )
+                request_drain()
+                drain_deadline = time.time() + grace
+                continue
+            if drain_deadline is not None and time.time() > drain_deadline:
+                log("  drain grace expired, kill batch")
                 kill_batch()
+                clear_drain()
                 break
         time.sleep(3)
         if cpa_count() >= TARGET_CPA:

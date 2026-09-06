@@ -19,6 +19,26 @@ from secure_files import atomic_write_json, exclusive_file_lock
 PROGRESS_ENV = "GROK_BATCH_PROGRESS_FILE"
 DEFAULT_IDLE_TIMEOUT = 360
 DEFAULT_MAX_RESTARTS = 8
+DRAIN_FILE = Path(__file__).resolve().parent / "log" / "batch-drain.json"
+DRAIN_FILE_MAX_AGE_SEC = 6 * 3600
+
+
+def drain_requested() -> bool:
+    """编排器轮次到期写入该文件；worker 完成在跑任务后退出，supervisor 不再重启。"""
+    try:
+        st = DRAIN_FILE.stat()
+    except OSError:
+        return False
+    if time.time() - st.st_mtime > DRAIN_FILE_MAX_AGE_SEC:
+        return False
+    try:
+        data = json.loads(DRAIN_FILE.read_text(encoding="utf-8") or "{}")
+        expire_at = float(data.get("expire_at") or 0)
+        if expire_at and time.time() > expire_at:
+            return False
+    except (OSError, ValueError, TypeError):
+        pass
+    return True
 
 _PROGRESS_LOCK = threading.Lock()
 _DRIVER_CRASH_MARKERS = (
@@ -213,7 +233,12 @@ def run_supervisor(
                         break
                 except queue.Empty:
                     pass
-                
+
+                # 收尾（drain）期间：worker 可能在跑长任务，暂停 idle 判定，
+                # 由编排器的 drain 宽限期兜底强杀。
+                if drain_requested():
+                    last_output = time.monotonic()
+
                 if restart_reason:
                     break
                 
@@ -239,6 +264,12 @@ def run_supervisor(
             return_code = active_process.poll()
             if restart_reason:
                 _terminate_process_group(active_process)
+                if drain_requested():
+                    print(
+                        "[supervisor] drain requested; stop without restart",
+                        flush=True,
+                    )
+                    return 0
                 restarts += 1
                 remaining = max(0, target - read_completed(progress_path))
                 print(
@@ -252,6 +283,13 @@ def run_supervisor(
             if return_code == 0 and completed >= target:
                 print(
                     f"[supervisor] child exited cleanly completed={completed}/{target}",
+                    flush=True,
+                )
+                return 0
+
+            if drain_requested():
+                print(
+                    f"[supervisor] drain requested; stop without restart completed={completed}/{target}",
                     flush=True,
                 )
                 return 0

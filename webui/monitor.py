@@ -167,7 +167,27 @@ def load_control() -> dict:
         c.setdefault("batch_count", 40)
         c.setdefault("add_count", 40)  # 再跑 N 个
         c.setdefault("mode", "orch")  # orch | batch
+        c.setdefault("attempt_timeout_sec", 360)  # 单任务最大时长，0=不限制
+        c.setdefault("round_timeout_min", 1440)  # 编排轮次上限（分钟），0=不限制
+        c.setdefault("mail_code_wait", 180)  # 验证码等待（秒）
         return c
+
+
+def _clamp_int_value(value, default: int, lo: int = 0, hi=None, allow_zero: bool = False) -> int:
+    """hi=None 表示不校验上限；负数/非法值回落 default；0 在 allow_zero 时保留。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    if n == 0 and allow_zero:
+        return 0
+    if n < lo:
+        return default
+    if hi is not None and n > hi:
+        return hi
+    return n
 
 
 def save_control(updates: dict) -> dict:
@@ -179,6 +199,9 @@ def save_control(updates: dict) -> dict:
         "mode",
         "base_cpa",
         "target_cpa",
+        "attempt_timeout_sec",
+        "round_timeout_min",
+        "mail_code_wait",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -199,6 +222,14 @@ def save_control(updates: dict) -> dict:
             c["add_count"] = max(1, min(500, int(c.get("add_count", 40))))
         except Exception:
             c["add_count"] = 40
+        # 单任务/轮次上限：仅要求 >=0 的整数（0=不限制），不设上限校验
+        c["attempt_timeout_sec"] = _clamp_int_value(
+            c.get("attempt_timeout_sec"), 360, allow_zero=True
+        )
+        c["round_timeout_min"] = _clamp_int_value(
+            c.get("round_timeout_min"), 1440, allow_zero=True
+        )
+        c["mail_code_wait"] = _clamp_int_value(c.get("mail_code_wait"), 180, 30, 600)
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
         for key in ("base_cpa", "target_cpa"):
             if c.get(key) is None or str(c.get(key)).strip() == "":
@@ -613,6 +644,14 @@ def _runtime_prerequisite_error() -> str | None:
     return None
 
 
+def clear_drain_flag() -> None:
+    """清理编排收尾标记，避免影响下一次启动。"""
+    try:
+        (LOG_DIR / "batch-drain.json").unlink()
+    except OSError:
+        pass
+
+
 def _start_orch_unlocked():
     proc = process_running()
     if proc.get("orch_running") or proc.get("batch_running"):
@@ -622,6 +661,7 @@ def _start_orch_unlocked():
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
         return {"ok": False, "error": prerequisite_error}
+    clear_drain_flag()
     c = load_control()
     now = cpa_count()
     add_count = c.get("add_count")
@@ -699,6 +739,7 @@ def _start_batch_only_unlocked():
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
         return {"ok": False, "error": prerequisite_error}
+    clear_drain_flag()
     c = load_control()
     workers = int(c.get("workers") or 3)
     count = int(c.get("batch_count") or 40)
@@ -749,6 +790,44 @@ def start_batch_only():
         return _start_batch_only_unlocked()
 
 
+def _count_results_since(epoch: float):
+    """register_results.jsonl 中 epoch（UTC 秒）之后的 (ok, fail) 计数。"""
+    from datetime import datetime, timezone
+
+    ok = 0
+    fail = 0
+    if not epoch or epoch <= 0:
+        return ok, fail
+    cutoff = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    path = LOG_DIR / "register_results.jsonl"
+    try:
+        if path.exists():
+            with path.open("rb") as f:
+                for line in f:
+                    try:
+                        o = json.loads(line.decode("utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    ts = str(o.get("ts") or "")
+                    if not ts:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt < cutoff:
+                        continue
+                    if o.get("status") == "ok":
+                        ok += 1
+                    elif o.get("status"):
+                        fail += 1
+    except Exception:
+        pass
+    return ok, fail
+
+
 def snapshot():
     log = discover_log()
     parsed = parse_log(log) if log else {"error": "no log"}
@@ -773,12 +852,23 @@ def snapshot():
     rate_per_min = None
     etime = proc.get("etime") or proc.get("batch_etime") or ""
     secs = _parse_etime(etime)
-    if secs and ok > 0:
-        rate_per_min = round(ok / (secs / 60.0), 2)
+    # 速率统一按“本次运行累计”口径：jsonl 中进程启动以来的成功数 / 运行分钟数。
+    # 旧口径（本批成功 / 编排累计用时）会在 40 分钟轮次重启后严重低估速率。
+    run_ok, run_fail = _count_results_since(time.time() - secs) if secs else (0, 0)
+    if secs and (run_ok + run_fail) > 0:
+        rate_per_min = round(run_ok / (secs / 60.0), 2)
+    remain = None
+    target_cpa_raw = control.get("target_cpa")
+    if target_cpa_raw is not None and str(target_cpa_raw).strip() != "":
+        try:
+            remain = max(int(target_cpa_raw) - cpa, 0)
+        except (TypeError, ValueError):
+            remain = None
+    if remain is None:
         remain = max(target - ok, 0)
-        if rate_per_min > 0:
-            eta_min = remain / rate_per_min
-            eta = f"{int(eta_min)}m" if eta_min < 120 else f"{eta_min/60:.1f}h"
+    if rate_per_min and rate_per_min > 0:
+        eta_min = remain / rate_per_min
+        eta = f"{int(eta_min)}m" if eta_min < 120 else f"{eta_min/60:.1f}h"
     workers_show = parsed.get("workers") or control.get("workers")
     return {
         "ts": time.time(),
@@ -793,6 +883,8 @@ def snapshot():
         "done_attempts": done,
         "progress_pct": pct,
         "success_rate": round(100.0 * ok / done, 1) if done else None,
+        "run_ok": run_ok,
+        "run_fail": run_fail,
         "rate_per_min": rate_per_min,
         "eta": eta,
         "blacklist": {
@@ -1029,9 +1121,13 @@ HTML = r"""<!DOCTYPE html>
   .section-meta { color: var(--muted); font-size: 12px; text-align: right; }
   .control-grid {
     display: grid;
-    grid-template-columns: minmax(220px, 1.6fr) minmax(150px, .9fr) repeat(4, minmax(100px, .55fr)) minmax(258px, auto);
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 12px;
     align-items: end;
+  }
+  @media (min-width: 1121px) {
+    .control-grid .field-token { grid-column: span 2; }
+    .control-grid .control-actions { grid-column: span 2; }
   }
   .control-actions {
     display: flex;
@@ -1844,6 +1940,15 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div class="field"><label for="risk_pause">风控阈值</label>
         <input type="number" id="risk_pause" min="1" max="50" value="10"/>
+      </div>
+      <div class="field"><label for="attempt_timeout_sec">单任务上限(秒)</label>
+        <input type="number" id="attempt_timeout_sec" min="0" step="30" value="360" title="单次注册尝试（含同槽位重试）的最长用时，超时记为任务超时并换出口；0 = 不限制"/>
+      </div>
+      <div class="field"><label for="round_timeout_min">轮次上限(分)</label>
+        <input type="number" id="round_timeout_min" min="0" step="5" value="1440" title="持续编排每轮最长运行时间，到期等待在跑任务收尾后自动开新一轮；0 = 不限制"/>
+      </div>
+      <div class="field"><label for="mail_code_wait">验证码等待(秒)</label>
+        <input type="number" id="mail_code_wait" min="30" max="600" step="10" value="180" title="等待验证码邮件的最长时间"/>
       </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()">启动任务</button>
@@ -3068,14 +3173,28 @@ function fillControl(d) {
   sync("batch_count", c.batch_count);
   sync("add_count", c.add_count);
   sync("risk_pause", c.risk_pause);
+  sync("attempt_timeout_sec", c.attempt_timeout_sec);
+  sync("round_timeout_min", c.round_timeout_min);
+  sync("mail_code_wait", c.mail_code_wait);
   sync("mode", c.mode);
 }
 function controlBody() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    if (!el) return fallback;
+    const raw = String(el.value ?? "").trim();
+    if (raw === "") return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  };
   return {
     workers: Number(document.getElementById("workers-input").value || 3),
     batch_count: Number(document.getElementById("batch_count").value || 40),
     add_count: Number((document.getElementById("add_count") || {}).value || 40),
     risk_pause: Number(document.getElementById("risk_pause").value || 10),
+    attempt_timeout_sec: num("attempt_timeout_sec", 360),
+    round_timeout_min: num("round_timeout_min", 1440),
+    mail_code_wait: num("mail_code_wait", 180),
     mode: document.getElementById("mode").value || "orch",
   };
 }
@@ -3269,13 +3388,14 @@ function render(d) {
   document.getElementById("btn-stop").disabled = !on;
   fillControl(d);
 
+  const runNote = d.run_ok != null ? " · 本次运行累计成功 " + d.run_ok : "";
   const kpis = [
-    ["本批成功", d.ok ?? 0, "ok", "目标 " + (d.target ?? "--")],
+    ["本批成功", d.ok ?? 0, "ok", "目标 " + (d.target ?? "--") + runNote],
     ["本批失败", d.fail ?? 0, "fail", d.success_rate != null ? "成功率 " + d.success_rate + "%" : "暂无数据"],
     ["CPA 总量", d.cpa ?? "--", "accent", "较基线 " + (d.cpa_delta != null ? ((Number(d.cpa_delta) >= 0 ? "+" : "") + d.cpa_delta) : "--")],
     ["正常 / 风控", (d.bot0 ?? 0) + " / " + (d.bot1 ?? 0), (d.bot1 ?? 0) > 0 ? "warn" : "ok", "注册结果采样"],
     ["黑名单 ASN", (d.blacklist && d.blacklist.count) ?? "--", "accent", "更新错误 " + ((d.blacklist_update && d.blacklist_update.error_count) ?? 0)],
-    ["预计完成", d.ended ? "已完成" : (d.eta || "--"), "", "并发 " + (d.workers ?? "--") + (d.rate_per_min != null ? " / " + d.rate_per_min + " 每分钟" : "")],
+    ["预计完成", d.ended ? "已完成" : (d.eta || "--"), "", "并发 " + (d.workers ?? "--") + (d.rate_per_min != null ? " / " + d.rate_per_min + " 每分钟（累计口径）" : "")],
   ];
   document.getElementById("kpis").innerHTML = kpis.map(([label, val, cls, sub]) =>
     `<div class="metric"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(val)}</div><div class="sub">${esc(sub)}</div></div>`

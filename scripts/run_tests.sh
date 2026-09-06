@@ -22,6 +22,7 @@ tests=(
   tests/test_no_live_hardcode.py
   tests/test_batch_chdir_import.py
   tests/test_batch_supervisor.py
+  tests/test_timeout_config.py
 )
 
 for test_file in "${tests[@]}"; do

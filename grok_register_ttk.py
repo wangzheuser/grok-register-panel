@@ -281,6 +281,57 @@ class RegistrationRiskDenied(Exception):
     """账号已创建，但服务端将本次注册裁决为 OAuth 不可用。"""
 
 
+class AttemptBudgetExceeded(RuntimeError):
+    """单次注册尝试超出可配置的最大时长（attempt_timeout_sec）。"""
+
+
+DRAIN_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "log", "batch-drain.json"
+)
+DRAIN_FILE_MAX_AGE_SEC = 6 * 3600
+_drain_logged = {"flag": False}
+
+
+def drain_requested() -> bool:
+    """编排器轮次到期时写入 batch-drain.json，worker 完成在跑任务后即退出。"""
+    try:
+        st = os.stat(DRAIN_FILE)
+    except OSError:
+        return False
+    if time.time() - st.st_mtime > DRAIN_FILE_MAX_AGE_SEC:
+        return False
+    try:
+        data = json.loads(Path(DRAIN_FILE).read_text(encoding="utf-8") or "{}")
+        expire_at = float(data.get("expire_at") or 0)
+        if expire_at and time.time() > expire_at:
+            return False
+    except (OSError, ValueError, TypeError):
+        pass
+    if not _drain_logged["flag"]:
+        _drain_logged["flag"] = True
+        cli_log("[!] 收到编排收尾请求：完成当前任务后退出，不再开始新的尝试")
+    return True
+
+
+def resolve_attempt_budget() -> int:
+    """单任务最大时长（秒）；0 或非法值 = 不限制。"""
+    try:
+        budget = int(float(config.get("attempt_timeout_sec", 360) or 0))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, budget)
+
+
+def check_attempt_deadline(deadline, budget):
+    """预算开启时超时抛 AttemptBudgetExceeded；deadline 为 None 表示未开启。"""
+    if deadline is None:
+        return
+    if time.monotonic() - deadline > 0:
+        raise AttemptBudgetExceeded(
+            f"单任务超时: 超过 {budget}s 未完成（含同槽位重试），强制结束本次尝试"
+        )
+
+
 
 FAIL_DOMAIN = "domain_rejected"
 FAIL_RISK = "registration_risk"
@@ -292,6 +343,7 @@ FAIL_SSO = "sso_timeout"
 FAIL_TURNSTILE = "turnstile"
 FAIL_PROFILE = "profile_fill"
 FAIL_OTHER = "other"
+FAIL_TASK_TIMEOUT = "task_timeout"
 
 
 def redact_proxy(url: str) -> str:
@@ -338,6 +390,7 @@ FAIL_LABELS = {
     FAIL_TURNSTILE: "资料页Turnstile",
     FAIL_PROFILE: "资料填写",
     FAIL_OTHER: "其它",
+    FAIL_TASK_TIMEOUT: "任务超时",
 }
 
 
@@ -448,6 +501,8 @@ def classify_failure(exc) -> str:
     low = msg.lower()
     if isinstance(exc, AccountRetryNeeded) or "达到最大重试" in msg or "流程卡住" in msg:
         return FAIL_STUCK
+    if "单任务超时" in msg or isinstance(exc, AttemptBudgetExceeded):
+        return FAIL_TASK_TIMEOUT
     if "sso_timeout" in low or "未获取到 sso" in msg or "未获取到 sso cookie" in msg:
         return FAIL_SSO
     if (
@@ -1670,12 +1725,19 @@ def get_email_and_token(api_key=None):
 def get_oai_code(
     dev_token,
     email,
-    timeout=180,
+    timeout=None,
     poll_interval=3,
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
 ):
+    if timeout is None:
+        # 面板可配“验证码等待(秒)”（monitor_control.json -> mail_code_wait），默认保持 180
+        try:
+            timeout = int(float(config.get("mail_code_wait", 180) or 180))
+        except (TypeError, ValueError):
+            timeout = 180
+        timeout = max(15, timeout)
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_oai_code(
@@ -3825,6 +3887,9 @@ def run_registration_cli(count):
             local_fail = 0
             local_fail_stats = empty_fail_stats()
             rotate_idx = 0
+            budget = resolve_attempt_budget()
+            if budget > 0:
+                cli_log(f"[W{wid+1}] [*] 单任务上限: {budget}s")
             try:
                 try:
                     px = pick_proxy_for_worker(wid, rotate_idx)
@@ -3888,31 +3953,37 @@ def run_registration_cli(count):
                 i = 0
                 retry = 0
                 worker_stop = False
-                while i < n and not controller.should_stop() and not worker_stop:
+                while i < n and not controller.should_stop() and not worker_stop and not drain_requested():
+                    deadline = (time.monotonic() + budget) if budget > 0 else None
                     email = ""
                     try:
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        check_attempt_deadline(deadline, budget)
                         email, dev_token = fill_email_and_submit(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        check_attempt_deadline(deadline, budget)
                         code = fill_code_and_submit(
                             email,
                             dev_token,
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        check_attempt_deadline(deadline, budget)
                         profile = fill_profile_and_submit(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        check_attempt_deadline(deadline, budget)
                         sso = wait_for_sso_cookie(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        check_attempt_deadline(deadline, budget)
                         ensure_sso_oauth_eligible(
                             sso,
                             email=email,
@@ -3970,6 +4041,27 @@ def run_registration_cli(count):
                             rotate_idx += 1
                     except RegistrationCancelled:
                         break
+                    except AttemptBudgetExceeded as exc:
+                        kind = FAIL_TASK_TIMEOUT
+                        local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
+                        local_fail += 1
+                        i += 1
+                        retry = 0
+                        cli_log(
+                            f"[W{wid+1}] [-] 失败 [{FAIL_LABELS.get(kind, kind)}]: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
+                        record_register_result(
+                            "fail",
+                            email or "",
+                            kind=kind,
+                            detail=str(exc)[:300],
+                            worker=f"W{wid+1}",
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
+                        mark_slot_completed()
+                        # 预算耗尽常伴随出口劣化，强制换 sticky
+                        rotate_idx += 1
                     except EmailDomainRejected as exc:
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
@@ -4226,10 +4318,14 @@ def run_registration_cli(count):
             )
             return
         cli_log("[*] 浏览器已启动")
+        budget = resolve_attempt_budget()
+        if budget > 0:
+            cli_log(f"[*] 单任务上限: {budget}s")
         i = 0
-        while i < count:
+        while i < count and not drain_requested():
             if controller.should_stop():
                 break
+            deadline = (time.monotonic() + budget) if budget > 0 else None
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             try:
                 email = ""
@@ -4242,10 +4338,12 @@ def run_registration_cli(count):
                     open_signup_page(
                         log_callback=cli_log, cancel_callback=controller.should_stop
                     )
+                    check_attempt_deadline(deadline, budget)
                     cli_log("[*] 2. 创建邮箱并提交")
                     email, dev_token = fill_email_and_submit(
                         log_callback=cli_log, cancel_callback=controller.should_stop
                     )
+                    check_attempt_deadline(deadline, budget)
                     cli_log(f"[*] 邮箱: {email}")
                     cli_log(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ''))})")
                     try:
@@ -4277,10 +4375,12 @@ def run_registration_cli(count):
                 if not mail_ok:
                     raise Exception("验证码阶段失败，已达到最大重试次数")
                 cli_log(f"[*] 验证码: {code}")
+                check_attempt_deadline(deadline, budget)
                 cli_log("[*] 4. 填写资料")
                 profile = fill_profile_and_submit(
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
+                check_attempt_deadline(deadline, budget)
                 cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
                 cli_log("[*] 5. 等待 sso cookie")
                 sso = wait_for_sso_cookie(
@@ -4339,6 +4439,24 @@ def run_registration_cli(count):
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
                 break
+            except AttemptBudgetExceeded as exc:
+                kind = _cli_record_failure(exc)
+                retry_count_for_slot = 0
+                i += 1
+                cli_log(
+                    f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: "
+                    f"{redact_sensitive_log_line(str(exc))}"
+                )
+                record_register_result(
+                    "fail",
+                    email or "",
+                    kind=kind,
+                    detail=str(exc),
+                    worker="W1",
+                    log_callback=cli_log,
+                )
+                mark_slot_completed()
+                single_rotate_idx += 1
             except EmailDomainRejected as exc:
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
